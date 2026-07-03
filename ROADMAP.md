@@ -97,6 +97,21 @@ trivial tags (`{% comment %}`, `{% verbatim %}`, `{% firstof %}`,
   referenced; `parentloop`/`revcounter`/`last` bookkeeping only when used;
   `{% if %}` conditions compile to native Python boolean expressions.
 
+Status: **complete.** Scoping decision made: compiled code performs *real*
+`context.push()`/`pop()`/`__setitem__` operations (locals-based scoping
+would break slow-path replays and filter args resolving against the live
+context — that optimization belongs with context flattening, designed once
+alongside the escape hatch). `forloop` dict maintenance is elided when the
+analysis pass proves no variable in the template starts with `forloop` —
+exact because compiled templates contain no unknown tags, so the reference
+set is statically complete. `{% if %}` conditions with operators evaluate
+through Django's own parsed condition objects (smart-if operator nodes
+swallow exceptions per-operator; that semantics stays theirs); bare-variable
+conditions get the inline fast path. Both oracle suites pass — compiled
+coverage in Django's suite doubled to ~1000 templates. Measured: 1.9x simple
+loops, 2.1x with/if scopes, 1.6x nested-loop tables; `{{ forloop.counter }}`
+rendering is localization-bound in both engines (phase 8 target).
+
 - **Decision forced:** how compiled code models context push/pop scoping
   (Django pushes a scope per loop iteration and per `with`) while staying
   cheap. This design must anticipate the phase-5 escape hatch.
@@ -125,6 +140,12 @@ visible to compiled code and vice versa).
 
 - Fast paths for `@simple_tag` / `@inclusion_tag`, which are declarative
   enough to compile directly and cover most real-world custom tags.
+- Note (phase 3 consequence): because compiled code maintains a *real*
+  `Context`, bridging an arbitrary node as `node.render(context)` is already
+  exact for any node — the hard escape-hatch problem only returns when
+  locals/flattening land. Phase 5 is therefore mostly: bridge by default
+  (via `render_annotated` to honor third-party overrides), plus the
+  simple_tag/inclusion_tag fast paths.
 - **Exit criterion: every parseable template compiles** — fallback granularity
   is now a node, not a template. This is the coverage cliff; after phase 5,
   real apps run mostly-compiled.

@@ -74,6 +74,13 @@ class SubStr(str):
     pass
 
 
+class NoLen:
+    """Iterable without __len__: ForNode materializes it with list()."""
+
+    def __iter__(self):
+        return iter(["g1", "g2", "g3"])
+
+
 class SilentException(Exception):
     silent_variable_failure = True
 
@@ -107,6 +114,10 @@ def base_context():
         "needs_args": NeedsArgs(),
         "fn": lambda: "<called>",
         "silent": Silent(),
+        "b": "truthy",
+        "empty_list": [],
+        "pairs": [("a", 1), ("b", 2)],
+        "gen": NoLen(),
     }
 
 
@@ -195,6 +206,53 @@ CASES = [
     '{{ "abc<"|upper }} {{ 2.5|add:1 }} {{ 40|add:"2" }}',
     # everything at once
     "<p>{{ name }} bought {{ obj.name }} for {{ f }} at {{ d.key }}</p>",
+    # {% if %}: bare variables, operators, precedence, errors-mean-False
+    "{% if name %}yes{% endif %}",
+    "{% if missing %}yes{% else %}no{% endif %}",
+    "{% if none %}a{% elif b %}b{% elif missing %}c{% else %}d{% endif %}",
+    "{% if n == 42 %}eq{% endif %} {% if n != 42 %}ne{% endif %}",
+    "{% if n > 41 and name %}both{% endif %}",
+    "{% if missing or name %}or{% endif %}",
+    "{% if not missing %}not{% endif %}",
+    "{% if 'o' in name %}in{% endif %} {% if 'q' not in name %}notin{% endif %}",
+    "{% if n in name %}weird{% else %}type-error-is-false{% endif %}",
+    "{% if name|length > 3 %}long{% endif %}",
+    "{% if obj.name %}attr{% endif %} {% if d.absent %}x{% else %}absent{% endif %}",
+    "{% if obj.delete %}callable-sii{% else %}falsy{% endif %}",
+    # {% for %}: forloop variants, empty, reversed, unpacking, nesting
+    "{% for x in items %}{{ x }},{% endfor %}",
+    "{% for x in items %}{{ forloop.counter }}:{{ x }} {% endfor %}",
+    "{% for x in items %}{{ forloop.counter0 }}{{ forloop.revcounter }}"
+    "{{ forloop.revcounter0 }}{{ forloop.first }}{{ forloop.last }} {% endfor %}",
+    "{% for x in items reversed %}{{ x }}{% endfor %}",
+    "{% for x in missing %}{{ x }}{% empty %}nothing{% endfor %}",
+    "{% for x in empty_list %}{{ x }}{% empty %}empty!{% endfor %}",
+    "{% for k, v in d.nested.items %}{{ k }}={{ v }};{% endfor %}",
+    "{% for a, b in pairs %}{{ a }}-{{ b }} {% endfor %}",
+    "{% for x in items %}{% for y in items %}{{ forloop.counter }}."
+    "{{ forloop.parentloop.counter }} {% endfor %}{% endfor %}",
+    "{% for x in items %}{{ x }}{% endfor %}{{ x }}",  # loop var scope pops
+    "{% for x in name %}{{ x }}.{% endfor %}",  # string iteration
+    # {% with %}
+    "{% with total=items greeting='hi<' %}{{ greeting }} {{ total.0 }}{% endwith %}{{ total }}",
+    "{% with inner=d.nested %}{{ inner.deeper.end }}{% endwith %}",
+    "{% with v=missing %}[{{ v }}]{% endwith %}",
+    # {% autoescape %}
+    "{% autoescape off %}{{ html }} {{ safe }}{% endautoescape %}{{ html }}",
+    "{% autoescape on %}{{ html }}{% endautoescape %}",
+    "{% autoescape off %}{% autoescape on %}{{ html }}{% endautoescape %}{{ html }}{% endautoescape %}",
+    "{% autoescape off %}{{ html|tagwrap }}{% endautoescape %}",  # needs_autoescape sees off
+    # {% comment %} / {% verbatim %}
+    "a{% comment %}gone {{ name }} {% now 'Y' %}{% endcomment %}b",
+    "{% verbatim %}{{ name }} {% if %} raw{% endverbatim %}",
+    # combined control flow
+    "{% for x in items %}{% if forloop.first %}[{% endif %}{{ x }}"
+    "{% if forloop.last %}]{% else %},{% endif %}{% endfor %}",
+    "{% for x in items %}{% with double=x %}{{ double }}{% endwith %}{% endfor %}",
+    "{% if items %}{% for x in items %}{{ x|upper }}{% endfor %}{% endif %}",
+    "{% for x in gen %}{{ x }}{% endfor %}",  # no __len__ -> list()
+    # inner loop shadows outer loop var; outer scope restores after pop
+    "{% for x in items %}{% for x in pairs %}{{ x.0 }}{% endfor %}{{ x }}|{% endfor %}",
 ]
 
 
@@ -280,6 +338,36 @@ def test_load_tag_compiles():
     assert template.render({"name": "hi"}) == "hi!!"
 
 
+def test_unpack_mismatch_error_identical():
+    errors = []
+    for backend_cls in (DTCTemplates, DjangoTemplates):
+        template = make_backend(backend_cls).from_string(
+            "{% for a, b in items %}{{ a }}{% endfor %}"
+        )
+        with pytest.raises(ValueError) as excinfo:
+            template.render(base_context())
+        errors.append(str(excinfo.value))
+    assert errors[0] == errors[1]  # message must match to the character
+
+
+def test_forloop_elided_when_unused():
+    template = make_backend(DTCTemplates).from_string(
+        "{% for x in items %}{{ x }}{% endfor %}"
+    )
+    source = template._compiled.__dtc_source__
+    assert "_forloop_" not in source
+    assert "enumerate" not in source
+
+
+def test_forloop_maintained_when_referenced():
+    template = make_backend(DTCTemplates).from_string(
+        "{% for x in items %}{{ forloop.counter }}{% endfor %}"
+    )
+    source = template._compiled.__dtc_source__
+    assert "'parentloop'" in source
+    assert "enumerate" in source
+
+
 def test_tags_fall_back():
     template = make_backend(DTCTemplates).from_string("{% now 'Y' %}")
     assert template._compiled is None
@@ -299,7 +387,9 @@ def test_codegen_shape():
     assert "_context_get('a')" in source  # first bit: inline context lookup
     assert "_value['b']" in source  # later bits: inline subscript fast path
     assert "getattr(_value, 'b')" in source  # ... with attribute branch
-    assert "_node_2.render(context)" in source  # slow path bridges to the node
+    import re
+
+    assert re.search(r"_node_\d+\.render\(context\)", source)  # slow-path bridge
 
 
 def test_codegen_shape_filters():

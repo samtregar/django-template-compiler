@@ -57,6 +57,28 @@ def scenarios():
         " ".join(["{{ a|upper|truncatechars:8 }} {{ b|join:', ' }}"] * 10),
         {"a": "hello world", "b": ["x", "y", "z"]},
     )
+    yield (
+        "loop_simple (100 rows, no forloop)",
+        "{% for row in rows %}<li>{{ row }}</li>{% endfor %}",
+        {"rows": [f"row {i}" for i in range(100)]},
+    )
+    yield (
+        "loop_forloop (100 rows, counters)",
+        "{% for row in rows %}<li>{{ forloop.counter }}: {{ row }}</li>{% endfor %}",
+        {"rows": [f"row {i}" for i in range(100)]},
+    )
+    yield (
+        "table (50x4, if + nested loop)",
+        "{% for row in table %}<tr {% if forloop.first %}class='f'{% endif %}>"
+        "{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>{% endfor %}",
+        {"table": [[f"c{r}.{c}" for c in range(4)] for r in range(50)]},
+    )
+    yield (
+        "with_if (scopes and branches)",
+        "{% for row in rows %}{% with v=row %}{% if v %}{{ v }}{% else %}-{% endif %}"
+        "{% endwith %}{% endfor %}",
+        {"rows": [f"row {i}" for i in range(50)]},
+    )
     # An uncompilable tag forces whole-template fallback: the floor is
     # "no slower than stock", not a speedup.
     yield (
