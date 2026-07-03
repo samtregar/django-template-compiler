@@ -67,17 +67,25 @@ from django.template.base import (
 from django.template.defaulttags import (
     AutoEscapeControlNode,
     CommentNode,
+    FilterNode,
     ForNode,
+    IfChangedNode,
     IfNode,
     LoadNode,
+    SpacelessNode,
     TemplateLiteral,
     VerbatimNode,
     WithNode,
 )
+from django.templatetags.i18n import LanguageNode
+from django.templatetags.l10n import LocalizeNode
+from django.templatetags.tz import LocalTimeNode, TimezoneNode
 from django.template.base import Template as BaseTemplate
 from django.template.library import InclusionNode, SimpleNode
 from django.template.loader_tags import BlockNode, ExtendsNode, IncludeNode
-from django.utils.html import conditional_escape, escape
+from django.utils import timezone as dj_timezone
+from django.utils import translation
+from django.utils.html import conditional_escape, escape, strip_spaces_between_tags
 from django.utils.safestring import SafeData, SafeString, mark_safe
 from django.utils.timezone import template_localtime
 
@@ -114,6 +122,26 @@ def _unpack_loop_item(loopvars, item):
             ),
         )
     return dict(zip(loopvars, item))
+
+
+def _digit_lookup(current, bit, index):
+    """One dotted-path step for an all-digits bit ({{ p.0 }}), in
+    Variable._resolve_lookup's order: string subscript (dicts with digit
+    keys), attribute, integer subscript (sequences). Any failure raises to
+    the caller, which replays through the original node — with one
+    documented shortcut: Django consults dir(current) before its integer
+    lookup to re-raise exceptions from properties, which cannot apply to a
+    name like '0' (dir entries are identifiers), so we skip that dir() call
+    and its per-miss cost."""
+    if hasattr(type(current), "__getitem__"):
+        try:
+            return current[bit]
+        except _LOOKUP_EXC:
+            try:
+                return getattr(current, bit)
+            except (TypeError, AttributeError):
+                return current[index]
+    return getattr(current, bit)
 
 
 def compile_template(template):
@@ -221,6 +249,27 @@ class _Analysis:
             elif node_type is IncludeNode:
                 if in_loop:
                     self.force_forloop = True
+            elif node_type is SpacelessNode:
+                self.walk(node.nodelist, in_loop)
+            elif node_type is FilterNode:
+                self._fe(node.filter_expr)
+                self.walk(node.nodelist, in_loop)
+            elif node_type is IfChangedNode:
+                # Its state frame IS the forloop dict when inside a loop.
+                if in_loop:
+                    self.force_forloop = True
+                for fe in node._varlist:
+                    self._fe(fe)
+                self.walk(node.nodelist_true, in_loop)
+                self.walk(node.nodelist_false, in_loop)
+            elif node_type in (LocalizeNode, LocalTimeNode):
+                self.walk(node.nodelist, in_loop)
+            elif node_type is TimezoneNode:
+                self._fe(node.tz)
+                self.walk(node.nodelist, in_loop)
+            elif node_type is LanguageNode:
+                self._fe(node.language)
+                self.walk(node.nodelist, in_loop)
             elif node_type in (SimpleNode, InclusionNode):
                 # Arguments resolve in the outer context; a takes_context
                 # function can read anything. (InclusionNode renders its
@@ -274,6 +323,16 @@ try:
 _LOOKUP_STEP = """\
     if _value is not _SLOW:
         _value = _value[{bit!r}] if hasattr(type(_value), '__getitem__') else getattr(_value, {bit!r})
+        if callable(_value):
+            _value = _SLOW
+"""
+
+# All-digits bits ({{ p.0 }}) take the three-way branch via _digit_lookup;
+# without this, sequence indexing would fail the fast path and replay the
+# whole node on every access.
+_LOOKUP_STEP_DIGIT = """\
+    if _value is not _SLOW:
+        _value = _digit_lookup(_value, {bit!r}, {index})
         if callable(_value):
             _value = _SLOW
 """
@@ -394,11 +453,15 @@ class _Codegen:
             "_template_localtime": template_localtime,
             "_VariableDoesNotExist": VariableDoesNotExist,
             "_unpack": _unpack_loop_item,
+            "_digit_lookup": _digit_lookup,
             "_render_block": runtime.render_block,
             "_render_extends": runtime.render_extends,
             "_render_include": runtime.render_include,
             "_template_render": runtime.template_render,
             "_conditional_escape": conditional_escape,
+            "_strip_spaces": strip_spaces_between_tags,
+            "_tz_override": dj_timezone.override,
+            "_lang_override": translation.override,
         }
         self._ids = itertools.count()
         self.block_defs = []  # (function name, body) per compiled block
@@ -506,7 +569,10 @@ class _Codegen:
         first, *rest = lookups
         block = _LOOKUP_FIRST.format(bit=first)
         for bit in rest:
-            block += _LOOKUP_STEP.format(bit=bit)
+            if bit.isdigit():
+                block += _LOOKUP_STEP_DIGIT.format(bit=bit, index=int(bit))
+            else:
+                block += _LOOKUP_STEP.format(bit=bit)
         return block + _LOOKUP_EXCEPT
 
     def _filter_call(self, func, args, i, j):
@@ -656,6 +722,115 @@ class _Codegen:
             loop=_indented(loop, 2),
         )
 
+    # --- container tags (bodies compile; the wrapper is mirrored) ----------
+    # Bridging a container tag would force its whole subtree to render
+    # interpreted, so containers get dedicated codegen. Leaf tags (url,
+    # csrf_token, static, now, ...) stay bridged: their render *is* the
+    # work, and a bridge costs the same as Django's own dispatch.
+
+    def _subrender(self, nodelist, i):
+        """Render a nodelist into _sub_{i} instead of the output buffer —
+        the compiled equivalent of `output = self.nodelist.render(context)`
+        (a SafeString, as NodeList.render returns)."""
+        return (
+            f"_saved_parts_{i} = _parts\n"
+            "_parts = []\n"
+            "_append = _parts.append\n"
+            + self.nodelist_block(nodelist)
+            + f"_sub_{i} = _mark_safe(''.join(_parts))\n"
+            f"_parts = _saved_parts_{i}\n"
+            "_append = _parts.append\n"
+        )
+
+    def visit_spaceless(self, node):
+        i = self.uid()
+        return (
+            self._subrender(node.nodelist, i)
+            + f"_append(_strip_spaces(_sub_{i}.strip()))\n"
+        )
+
+    def visit_filter_tag(self, node):
+        # FilterNode.render: body renders first, then resolves the parsed
+        # 'var|filters' expression with the output pushed as 'var'.
+        i = self.uid()
+        self.namespace[f"_ffe_{i}"] = node.filter_expr
+        return (
+            self._subrender(node.nodelist, i)
+            + f"context.push({{'var': _sub_{i}}})\n"
+            "try:\n"
+            f"    _append(_ffe_{i}.resolve(context))\n"
+            "finally:\n"
+            "    context.pop()\n"
+        )
+
+    def visit_ifchanged(self, node):
+        """IfChangedNode.render: state lives on the forloop dict inside
+        loops (analysis forces the dict on), else on render_context, keyed
+        by the node — which also makes this template non-shareable."""
+        i = self.uid()
+        self.namespace[f"_node_{i}"] = node
+        self.uses_bridges = True  # identity-keyed state: per-parse function
+        block = (
+            f"_ifch_frame_{i} = context['forloop'] if 'forloop' in context"
+            " else context.render_context\n"
+            f"_ifch_frame_{i}.setdefault(_node_{i})\n"
+        )
+        if node._varlist:
+            for k, fe in enumerate(node._varlist):
+                self.namespace[f"_ifv_{i}_{k}"] = fe
+            compare = ", ".join(
+                f"_ifv_{i}_{k}.resolve(context, True)"
+                for k in range(len(node._varlist))
+            )
+            block += (
+                f"_ifch_cmp_{i} = [{compare}]\n"
+                f"if _ifch_cmp_{i} != _ifch_frame_{i}[_node_{i}]:\n"
+                f"    _ifch_frame_{i}[_node_{i}] = _ifch_cmp_{i}\n"
+                + _indented(self.nodelist_block(node.nodelist_true))
+            )
+        else:
+            # Without variables, the comparison value is the rendered body.
+            block += (
+                self._subrender(node.nodelist_true, i)
+                + f"if _sub_{i} != _ifch_frame_{i}[_node_{i}]:\n"
+                f"    _ifch_frame_{i}[_node_{i}] = _sub_{i}\n"
+                f"    _append(_sub_{i})\n"
+            )
+        if node.nodelist_false:
+            block += "else:\n" + _indented(self.nodelist_block(node.nodelist_false))
+        return block
+
+    def _flag_wrapper(self, node, attr, value):
+        # LocalizeNode / LocalTimeNode: set a context flag, render, restore
+        # (no exception guard, matching Django).
+        i = self.uid()
+        return (
+            f"_saved_flag_{i} = context.{attr}\n"
+            f"context.{attr} = {value!r}\n"
+            + self.nodelist_block(node.nodelist)
+            + f"context.{attr} = _saved_flag_{i}\n"
+        )
+
+    def visit_localize(self, node):
+        return self._flag_wrapper(node, "use_l10n", node.use_l10n)
+
+    def visit_localtime(self, node):
+        return self._flag_wrapper(node, "use_tz", node.use_tz)
+
+    def _override_wrapper(self, node, fe, manager):
+        # TimezoneNode / LanguageNode: body renders under a with-block.
+        i = self.uid()
+        self.namespace[f"_ctxfe_{i}"] = fe
+        return f"with {manager}(_ctxfe_{i}.resolve(context)):\n" + _indented(
+            self.nodelist_block(node.nodelist)
+        )
+
+    def visit_timezone(self, node):
+        return self._override_wrapper(node, node.tz, "_tz_override")
+
+    def visit_language(self, node):
+        return self._override_wrapper(node, node.language, "_lang_override")
+
     # --- inheritance and inclusion ----------------------------------------
 
     def visit_block(self, node):
@@ -788,4 +963,11 @@ class _Codegen:
         IncludeNode: visit_include,
         SimpleNode: visit_simple,
         InclusionNode: visit_inclusion,
+        SpacelessNode: visit_spaceless,
+        FilterNode: visit_filter_tag,
+        IfChangedNode: visit_ifchanged,
+        LocalizeNode: visit_localize,
+        LocalTimeNode: visit_localtime,
+        TimezoneNode: visit_timezone,
+        LanguageNode: visit_language,
     }

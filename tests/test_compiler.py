@@ -126,6 +126,8 @@ def base_context():
             {"name": "bob", "team": "red"},
             {"name": "cat", "team": "blue"},
         ],
+        "tzname": "Asia/Tokyo",
+        "digitmap": {"0": "string-key-zero", "1": "string-key-one"},
     }
 
 
@@ -286,6 +288,26 @@ CASES = [
     # phase 5: raw third-party node mutating the live context
     "{% poke stamped %}{{ stamped }}",
     "{% for x in items %}{% poke inner %}{{ inner }}{% endfor %}",
+    # phase 6: container tags compile (bodies no longer render interpreted)
+    "{% spaceless %}<p> <a>{% for x in items %} <i>{{ x }}</i> {% endfor %}</a> </p>{% endspaceless %}",
+    "{% filter upper %}mixed {{ name }} and {{ html }}{% endfilter %}",
+    "{% filter truncatechars:12|lower %}LONG {{ name }} OUTPUT HERE{% endfilter %}",
+    "{% for x in repeats %}{% ifchanged %}{{ x }}{% else %}-{% endifchanged %}{% endfor %}",
+    "{% for p in people %}{% ifchanged p.team %}[{{ p.team }}]{% else %}.{% endifchanged %}"
+    "{{ p.name }}{% endfor %}",
+    "{% for x in items %}{% for y in repeats %}{% ifchanged %}{{ y }}{% endifchanged %}"
+    "{% endfor %}|{% endfor %}",  # inner-loop state resets per outer iteration
+    "{% ifchanged name %}outside-loop{% endifchanged %}",
+    "{% load l10n %}{% localize off %}{{ f }}{% endlocalize %} {{ f }}"
+    "{% localize on %}{{ f }}{% endlocalize %}",
+    "{% load tz %}{% localtime off %}{{ dt }}{% endlocaltime %} {{ dt }}",
+    "{% load tz %}{% timezone 'America/New_York' %}{{ dt }}{% endtimezone %}"
+    "{% timezone tzname %}{{ dt }}{% endtimezone %}",
+    "{% load i18n %}{% language 'de' %}{{ name }}{% endlanguage %}",
+    # digit-bit lookups: sequences, string-digit dict keys, out of range
+    "{{ pairs.0.1 }} {{ pairs.1.0 }} {{ items.2 }}",
+    "{{ digitmap.0 }} {{ digitmap.1 }}",
+    "[{{ pairs.9 }}] [{{ digitmap.7 }}]",
 ]
 
 
@@ -593,6 +615,24 @@ def test_forloop_maintained_when_referenced():
     source = template._compiled.__dtc_source__
     assert "'parentloop'" in source
     assert "enumerate" in source
+
+
+def test_container_tags_fully_compiled():
+    """Containers must not bridge — their bodies would render interpreted."""
+    for source in (
+        "{% spaceless %}{{ a }}{% endspaceless %}",
+        "{% filter upper %}{{ a }}{% endfilter %}",
+        "{% for x in items %}{% ifchanged %}{{ x }}{% endifchanged %}{% endfor %}",
+    ):
+        template = make_backend(DTCTemplates).from_string(source)
+        assert ".render_annotated(" not in template._compiled.__dtc_source__, source
+
+
+def test_ifchanged_template_not_shareable():
+    template = make_backend(DTCTemplates).from_string(
+        "{% ifchanged name %}x{% endifchanged %}"
+    )
+    assert not template._compiled.__dtc_shareable__
 
 
 def test_unknown_tags_bridge():

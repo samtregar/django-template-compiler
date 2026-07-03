@@ -79,6 +79,18 @@ def scenarios():
         "{% endwith %}{% endfor %}",
         {"rows": [f"row {i}" for i in range(50)]},
     )
+    yield (
+        "container (spaceless around table)",
+        "{% spaceless %}{% for row in table %}<tr> {% for cell in row %}"
+        "<td> {{ cell }} </td> {% endfor %}</tr>{% endfor %}{% endspaceless %}",
+        {"table": [[f"c{r}.{c}" for c in range(4)] for r in range(25)]},
+    )
+    yield (
+        "ifchanged (grouped rows)",
+        "{% for p in people %}{% ifchanged p.0 %}<h2>{{ p.0 }}</h2>{% endifchanged %}"
+        "<p>{{ p.1 }}</p>{% endfor %}",
+        {"people": [(f"team{i // 10}", f"member{i}") for i in range(50)]},
+    )
     # A tag without dedicated codegen bridges per-node; the surrounding
     # variables still compile. The floor is "no slower than stock".
     yield (

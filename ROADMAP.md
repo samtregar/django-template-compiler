@@ -194,6 +194,22 @@ stateful and odd tags: `{% cycle %}` (state across loop iterations, `silent`),
 Prioritize by frequency in real codebases: `url`, `csrf_token`, and i18n
 carry most production templates.
 
+Status: **complete**, with the priorities inverted by a phase 5 insight:
+leaf tags (`url`, `csrf_token`, `static`, `now`, `cycle`, `regroup`, ...)
+stay bridged deliberately — their render *is* the work (`reverse()`,
+storage lookups), so dedicated codegen would save nothing measurable.
+**Container** tags are where bridging hurts (the whole subtree renders
+interpreted), so those got codegen: `{% spaceless %}`, `{% filter %}`,
+`{% ifchanged %}` (both forms, with identity-keyed state making templates
+non-shareable, and an in-loop force of the forloop dict — it's the state
+frame), `{% localize %}`, `{% localtime %}`, `{% timezone %}`,
+`{% language %}` (all verified identical across 4.2–5.2). Bodies compile
+via a sub-buffer. Also fixed en route: all-digits lookup bits ({{ p.0 }})
+previously failed the fast path and replayed the node every access — now a
+dedicated three-way step (0.95x → 1.6x on grouped-rows rendering).
+Measured: spaceless-wrapped table 2.0x. Still bridged and noted for later:
+`{% cache %}` (body renders only on cache miss), `{% blocktrans %}`.
+
 ## Phase 7 — The 100% milestone
 
 - Django's full `template_tests` suite passes with **fallback disabled**
