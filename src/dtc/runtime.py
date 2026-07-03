@@ -30,13 +30,27 @@ from django.template.loader_tags import (
 _MISSING = object()
 
 #: Compile/render counters (autopatch adds render counts): lets oracle-suite
-#: runs prove the compiled path was actually exercised.
+#: runs prove the compiled path was actually exercised. templates_error
+#: counts fail-open compiler errors — anything nonzero is a dtc bug.
 stats = {
     "templates_compiled": 0,
     "templates_fallback": 0,
+    "templates_error": 0,
     "renders_compiled": 0,
     "renders_fallback": 0,
 }
+
+# Template._render as shipped by Django, captured before anything patches
+# it. If someone has replaced it — Django's test instrumentation
+# (setup_test_environment installs instrumented_test_render, which sends the
+# template_rendered signal that assertTemplateUsed depends on), dtc's own
+# autopatch, or any third-party hook — the compiled shortcuts below must
+# route through the patched machinery instead of around it.
+_pristine_render = Template._render
+
+
+def _render_is_patched(template):
+    return type(template)._render is not _pristine_render
 
 
 # engine -> {(template name, source): compiled fn or None}. Engines without
@@ -84,6 +98,8 @@ def render_body(template, context):
     """``Template._render(context)``, compiled when possible. Used where
     Django deliberately calls ``_render`` (ExtendsNode: parent shares the
     child's bound context)."""
+    if _render_is_patched(template):
+        return template._render(context)
     fn = compiled_for(template)
     if fn is None:
         return template._render(context)
@@ -97,6 +113,11 @@ def template_render(template, context):
     if not isinstance(template, Template):
         # e.g. {% include template_object %} where the object came from a
         # foreign engine: exactly what Django would call.
+        return template.render(context)
+    if _render_is_patched(template):
+        # Test instrumentation (template_rendered signal), autopatch, or a
+        # third-party hook owns _render: go through Template.render so the
+        # patch runs exactly as it would under stock Django.
         return template.render(context)
     fn = compiled_for(template)
     if fn is None:

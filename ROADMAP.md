@@ -221,6 +221,25 @@ Measured: spaceless-wrapped table 2.0x. Still bridged and noted for later:
   story.
 - Differential fuzzer as a second oracle layer.
 
+Status: **complete.**
+
+- Strict mode (`dtc.compiler.STRICT` / `DTC_STRICT=1`): internal compiler
+  errors raise instead of falling back; the oracle suite runner always sets
+  it, so a compiler bug fails CI loudly. Both suites pass strict with
+  `templates_error: 0` — the fallback allowlist is exactly one category:
+  debug engines (by policy — Django's debug error page needs the
+  interpreted path; documented in the README).
+- Test instrumentation honored: the compiled shortcuts check whether
+  `Template._render` is pristine and route through any patch (Django's
+  `instrumented_test_render`, autopatch, third-party hooks), so
+  `template_rendered`/`assertTemplateUsed` behave exactly as stock.
+- Parse-time exception behavior is Django's own parser (differential tests
+  document message equality); render-time exception timing covered by the
+  differential suites.
+- `tests/test_fuzz.py`: grammar-based differential fuzzer over the compiled
+  feature set (fresh seed per run, reproducible via `DTC_FUZZ_SEED`); 300
+  iterations per CI run, 50k iterations run clean during development.
+
 ## Phase 8 — Performance and release
 
 - Optimization passes informed by profiling: context flattening, per-engine

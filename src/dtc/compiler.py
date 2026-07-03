@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 
 from django.template.base import (
     TextNode,
@@ -92,6 +93,12 @@ from django.utils.timezone import template_localtime
 from . import runtime
 
 logger = logging.getLogger("dtc")
+
+#: When true (or DTC_STRICT=1 in the environment), internal compiler errors
+#: raise instead of falling back to Django's renderer. Rendering stays
+#: fail-open in production; the oracle suites run strict so a compiler bug
+#: fails CI loudly rather than hiding behind the fallback.
+STRICT = False
 
 # Exactly the exceptions Variable._resolve_lookup catches on the dictionary
 # lookup attempt. UnicodeDecodeError is a ValueError subclass, so it lands in
@@ -159,6 +166,11 @@ def compile_template(template):
         return _compile(template)
     except Exception:
         # A compiler bug must never break rendering; fall back to Django.
+        if STRICT or os.environ.get("DTC_STRICT") == "1":
+            raise
+        from . import runtime
+
+        runtime.stats["templates_error"] += 1
         logger.exception("dtc failed to compile %r; falling back", template.name)
         return None
 

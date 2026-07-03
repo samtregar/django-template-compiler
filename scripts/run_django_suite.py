@@ -44,7 +44,11 @@ def main():
         )
 
     import dtc.autopatch
+    import dtc.compiler
 
+    # Fail loudly on internal compiler errors instead of falling back:
+    # in oracle runs, a silent fallback would hide a dtc bug.
+    dtc.compiler.STRICT = True
     dtc.autopatch.install()
 
     @atexit.register

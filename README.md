@@ -2,7 +2,12 @@
 
 A drop-in replacement for Django's template engine, 100% compatible including custom tags and filters, but much faster.
 
-**Status: pre-alpha.** The engine backend works today by delegating to Django's renderer; the compiler that makes it fast is under construction. Not ready for production use.
+**Status: pre-alpha, but substantially complete.** Every parseable template compiles: dedicated code generation for the core template language (variables, filters, control flow, inheritance, `simple_tag`/`inclusion_tag`, container tags), with anything else — arbitrary third-party tags included — running as-is against the live context. dtc passes Django's own template test suite (Django 4.2–5.2) in CI, plus a differential fuzzer. Typical speedups: 1.6–2.1x on template-bound rendering, with a ~1.0x floor when a template is dominated by bridged tags. Not yet exercised by production traffic — try it and report.
+
+Two behaviors worth knowing:
+
+- **`DEBUG=True` disables compilation** (per engine): Django's debug error page and exception annotation need the interpreted render path. Production configs get the compiled path; development keeps perfect debugging.
+- **Django test instrumentation is honored**: when `setup_test_environment()` (the test runner / `assertTemplateUsed`) patches template rendering, dtc detects the patch and routes through it, so the `template_rendered` signal fires exactly as with stock Django.
 
 ## How it works
 

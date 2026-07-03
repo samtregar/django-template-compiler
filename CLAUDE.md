@@ -6,7 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A drop-in replacement for Django's template engine that compiles templates to Python for speed, with **100% compatibility** as a hard requirement — including third-party custom tags and filters. Output must be byte-identical to Django's stock engine in all cases. When compatibility and speed conflict, compatibility wins: anything the compiler can't handle correctly must fall back to Django's interpreted renderer rather than approximate it.
 
-Work proceeds in phases — see `ROADMAP.md` for the current phase and what's deliberately deferred.
+Work proceeds in phases — see `ROADMAP.md` for the current phase and what's deliberately deferred. Phases 1–7 are complete; phase 8 (performance) remains.
+
+Correctness invariants to preserve when changing the compiler:
+- Oracle suites run **strict** (`DTC_STRICT`): compiler errors fail CI rather than falling back. Keep it that way.
+- Compiled shortcuts must honor a patched `Template._render` (test instrumentation, autopatch, third-party hooks) — see `runtime._render_is_patched`.
+- Templates whose compiled function embeds bridged or identity-keyed-state nodes are non-shareable across parses (`__dtc_shareable__`).
+- `tests/test_fuzz.py` fuzzes with a fresh seed every run; a CI fuzz failure is a real bug — reproduce with the printed `DTC_FUZZ_SEED`.
 
 ## Naming
 

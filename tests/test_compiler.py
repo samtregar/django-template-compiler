@@ -556,6 +556,85 @@ def test_block_bodies_attached():
         assert callable(block.__dict__.get("_dtc_body"))
 
 
+# --- tooling compatibility (phase 7) ------------------------------------------
+
+
+def test_template_rendered_signal_under_test_instrumentation():
+    """assertTemplateUsed depends on the template_rendered signal that
+    Django's test environment injects by patching Template._render; the
+    compiled path must detect the patch and route through it."""
+    from django.test.signals import template_rendered
+    from django.test.utils import setup_test_environment, teardown_test_environment
+
+    setup_test_environment()
+    try:
+        received = []
+
+        def receiver(sender, **kwargs):
+            received.append(kwargs.get("template"))
+
+        template_rendered.connect(receiver)
+        try:
+            template = make_backend(DTCTemplates).from_string("sig:{{ name }}")
+            assert template.render({"name": "x"}) == "sig:x"
+            assert len(received) == 1
+        finally:
+            template_rendered.disconnect(receiver)
+    finally:
+        teardown_test_environment()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "{% if %}x{% endif %}",
+        "{% endif %}",
+        "{% unknowntag %}",
+        "{{ x|unknownfilter }}",
+        "{% for x %}{% endfor %}",
+        "{% extends 'a' %}{% extends 'b' %}",
+    ],
+)
+def test_parse_errors_identical(source):
+    """Parse-time errors happen in Django's parser before dtc is involved;
+    message equality documents the guarantee."""
+    from django.template import TemplateSyntaxError
+
+    messages = []
+    for backend_cls in (DTCTemplates, DjangoTemplates):
+        with pytest.raises(TemplateSyntaxError) as excinfo:
+            make_backend(backend_cls).from_string(source)
+        messages.append(str(excinfo.value))
+    assert messages[0] == messages[1]
+
+
+def test_compiler_bug_fails_open_and_counts(monkeypatch):
+    from dtc import compiler
+    from dtc.runtime import stats
+
+    def boom(template):
+        raise RuntimeError("injected bug")
+
+    monkeypatch.setattr(compiler, "_compile", boom)
+    before = stats["templates_error"]
+    template = make_backend(DTCTemplates).from_string("{{ name }}")
+    assert template._compiled is None  # fell back
+    assert template.render({"name": "x"}) == "x"  # renders via Django
+    assert stats["templates_error"] == before + 1  # and is not silent
+
+
+def test_strict_mode_raises_on_compiler_bug(monkeypatch):
+    from dtc import compiler
+
+    def boom(template):
+        raise RuntimeError("injected bug")
+
+    monkeypatch.setattr(compiler, "_compile", boom)
+    monkeypatch.setattr(compiler, "STRICT", True)
+    with pytest.raises(RuntimeError, match="injected bug"):
+        make_backend(DTCTemplates).from_string("{{ name }}")
+
+
 # --- compiled/fallback classification ----------------------------------------
 
 
