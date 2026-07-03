@@ -48,9 +48,21 @@ def scenarios():
         {"a": "A", "b": "B", "c": "C", "d": "D"},
     )
     yield (
-        "filters_bridged (worst case)",
-        " ".join(["{{ a|upper }} {{ b|title }}"] * 10),
-        {"a": "hello", "b": "world"},
+        "filters_light (20 x upper)",
+        " ".join(["{{ a|upper }} {{ b|lower }}"] * 10),
+        {"a": "hello", "b": "WORLD"},
+    )
+    yield (
+        "filters (20 x chained/args)",
+        " ".join(["{{ a|upper|truncatechars:8 }} {{ b|join:', ' }}"] * 10),
+        {"a": "hello world", "b": ["x", "y", "z"]},
+    )
+    # An uncompilable tag forces whole-template fallback: the floor is
+    # "no slower than stock", not a speedup.
+    yield (
+        "tag_fallback (worst case)",
+        "{% now 'Y' %} " + " ".join("{{ v%d }}" % i for i in range(10)),
+        {f"v{i}": f"value {i}" for i in range(10)},
     )
 
 
@@ -72,7 +84,8 @@ def main():
     for name, source, context in scenarios():
         dtc_template = dtc_backend.from_string(source)
         django_template = django_backend.from_string(source)
-        assert dtc_template._compiled is not None, f"{name} did not compile"
+        if "fallback" not in name:
+            assert dtc_template._compiled is not None, f"{name} did not compile"
         assert dtc_template.render(dict(context)) == django_template.render(
             dict(context)
         ), f"{name} output mismatch"

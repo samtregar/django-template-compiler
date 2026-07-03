@@ -70,13 +70,20 @@ case (bridged filters).
 - Policy decision: when `debug=True`, don't compile (Django's debug error
   page needs its own render internals). Revisit in phase 7.
 
-## Phase 2 — Filters
+## Phase 2 — Filters ✅
 
 Full `FilterExpression` semantics: filter arguments (literal and variable),
 `is_safe`/`needs_autoescape`/`expects_localtime`, safe-string propagation.
 Call Django's registered filter functions directly — never reimplement them.
 Consequence worth advertising: **custom filters compile natively** from this
 phase on, since a filter is just a registered callable.
+
+Status: **complete.** The behavior flags are read at compile time (they're
+constant per function) and codegen specializes on them; plain-str constant
+args fold, lazy i18n constants keep translating per render; `{% load %}`
+compiles away. Both oracle suites pass. Measured: 1.66x on light filter
+chains; ~1.2x when heavyweight filter bodies dominate (Amdahl's law — the
+filter work itself is unchanged, as it must be).
 
 ## Phase 3 — Control flow and scoping
 

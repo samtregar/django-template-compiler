@@ -115,6 +115,7 @@ def base_context():
 
 def render_both(source, context=None, **options):
     """Render through dtc and stock Django; return (dtc_template, dtc_out, django_out)."""
+    options.setdefault("builtins", ["support"])  # custom filters, no {% load %}
     dtc_template = make_backend(DTCTemplates, **options).from_string(source)
     django_template = make_backend(DjangoTemplates, **options).from_string(source)
     context = base_context() if context is None else context
@@ -166,10 +167,32 @@ CASES = [
     "{{ htmlobj }}",
     # literals
     '{{ "quoted<>" }} {{ 2.5 }} {{ 37 }} {{ True }} {{ None }}',
-    # filters (bridged through the original node in phase 1)
+    # filters: builtins across the behavior flags
     "{{ name|upper }} {{ html|title }}",
     "{{ missing|default:'fallback' }}",
+    "{{ none|default:'nada' }}",
     "{{ html|safe }}",
+    "{{ html|escape }} {{ safe|escape }}",
+    "{{ items|join:', ' }} {{ items|join:html }}",  # needs_autoescape + var arg
+    "{{ dt|date:'Y-m-d H:i' }} {{ dt|time }}",  # expects_localtime
+    "{{ n|add:8 }} {{ n|add:'7' }} {{ n|add:n }}",
+    "{{ f|floatformat:2 }} {{ f|floatformat:'-1' }}",
+    "{{ html|striptags|upper }}",
+    "{{ name|slice:':3'|capfirst }}",
+    "{{ items|length }}",
+    "{{ html|truncatechars:8 }} {{ html|truncatewords:1 }}",
+    # filters: safety propagation through chains
+    "{{ safe|upper }}",  # SafeString in, is_safe=False filter -> re-escaped
+    "{{ safe|slice:':4' }}",  # is_safe=True filter keeps input's safety
+    "{{ html|upper|lower }}",
+    # custom filters from the support library (compile natively)
+    "{{ name|shout }} {{ html|shout }} {{ safe|shout }}",
+    "{{ html|exclaim }} {{ safe|exclaim }}",  # is_safe=True
+    "{{ html|tagwrap }} {{ safe|tagwrap }}",  # needs_autoescape
+    "{{ dt|hourof }}",  # expects_localtime
+    "{{ name|shout|exclaim|tagwrap }}",
+    # filters on literals (never fold through a filter call)
+    '{{ "abc<"|upper }} {{ 2.5|add:1 }} {{ 40|add:"2" }}',
     # everything at once
     "<p>{{ name }} bought {{ obj.name }} for {{ f }} at {{ d.key }}</p>",
 ]
@@ -229,6 +252,34 @@ def test_render_reusable():
 # --- compiled/fallback classification ----------------------------------------
 
 
+def test_filter_exception_propagates():
+    for backend_cls in (DTCTemplates, DjangoTemplates):
+        template = make_backend(backend_cls, builtins=["support"]).from_string(
+            "{{ name|crash }}"
+        )
+        with pytest.raises(RuntimeError, match="filter boom"):
+            template.render(base_context())
+
+
+def test_missing_filter_arg_raises():
+    # Unlike a missing variable ahead of the filters, a missing variable
+    # *argument* raises VariableDoesNotExist in Django.
+    from django.template.base import VariableDoesNotExist
+
+    for backend_cls in (DTCTemplates, DjangoTemplates):
+        template = make_backend(backend_cls).from_string("{{ name|default:absent }}")
+        with pytest.raises(VariableDoesNotExist):
+            template.render(base_context())
+
+
+def test_load_tag_compiles():
+    template = make_backend(DTCTemplates, libraries={"custom": "support"}).from_string(
+        "{% load custom %}{{ name|shout }}"
+    )
+    assert template._compiled is not None
+    assert template.render({"name": "hi"}) == "hi!!"
+
+
 def test_tags_fall_back():
     template = make_backend(DTCTemplates).from_string("{% now 'Y' %}")
     assert template._compiled is None
@@ -249,3 +300,12 @@ def test_codegen_shape():
     assert "_value['b']" in source  # later bits: inline subscript fast path
     assert "getattr(_value, 'b')" in source  # ... with attribute branch
     assert "_node_2.render(context)" in source  # slow path bridges to the node
+
+
+def test_codegen_shape_filters():
+    template = make_backend(DTCTemplates).from_string("{{ a|join:', '|upper }}")
+    source = template._compiled.__dtc_source__
+    # join is registered is_safe=True + needs_autoescape=True
+    assert "_filter_0_0(_input, _arg_0_0_0, autoescape=_autoescape)" in source
+    assert "_filter_0_1(_value)" in source  # upper
+    assert "except UnicodeDecodeError:" in source  # VariableNode.render's catch

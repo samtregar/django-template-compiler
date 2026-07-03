@@ -1,8 +1,9 @@
 """Compile parsed Django templates to Python.
 
-Phase 1: templates consisting solely of ``TextNode`` and ``VariableNode``
-compile to a generated Python function; anything else returns ``None`` and
-the backend falls back to Django's interpreted renderer.
+Phases 1–2: templates consisting of ``TextNode``, ``VariableNode`` (with or
+without filters), and ``{% load %}`` compile to a generated Python function;
+anything else returns ``None`` and the backend falls back to Django's
+interpreted renderer.
 
 The compiled function replaces ``Template._render`` — it receives a fully
 bound ``Context`` (the caller reproduces ``Template.render``'s
@@ -16,9 +17,17 @@ Exactness strategy, per the roadmap's optimization principle:
   ``Variable._resolve_lookup`` (dict lookup first, guarded by the same
   ``hasattr(type(x), "__getitem__")`` check, bit-by-bit) plus the common-type
   fast path of ``render_value_in_context`` (exact ``str``/``SafeString``).
+- Filters call the *registered filter function* directly — never a
+  reimplementation. ``FilterExpression.resolve`` reads each function's
+  behavior flags (``is_safe``/``needs_autoescape``/``expects_localtime``)
+  via getattr on every render; those are constant per function, so codegen
+  specializes on them at compile time. This means custom filters compile
+  natively. String constant arguments fold (``mark_safe`` of a plain str is
+  deterministic); lazy i18n constants and variable arguments resolve per
+  render through Django's own objects.
 - The moment anything deviates from the provably-identical happy path — a
-  lookup failure, a callable, an unusual value type, filters, translation —
-  the generated code delegates to the *original node's* ``render()`` (or to
+  lookup failure, a callable, an unusual value type, translation — the
+  generated code delegates to the *original node's* ``render()`` (or to
   Django's ``render_value_in_context``), so slow-path semantics are Django's
   own code, byte-identical by construction.
 
@@ -34,8 +43,10 @@ from __future__ import annotations
 import logging
 
 from django.template.base import TextNode, Variable, VariableNode, render_value_in_context
+from django.template.defaulttags import LoadNode
 from django.utils.html import escape
-from django.utils.safestring import SafeString, mark_safe
+from django.utils.safestring import SafeData, SafeString, mark_safe
+from django.utils.timezone import template_localtime
 
 logger = logging.getLogger("dtc")
 
@@ -79,8 +90,10 @@ def _compile(template):
         "_SLOW": _SLOW,
         "_escape": escape,
         "_render_value": render_value_in_context,
+        "_SafeData": SafeData,
         "_SafeString": SafeString,
         "_mark_safe": mark_safe,
+        "_template_localtime": template_localtime,
     }
     lines = [
         "def _dtc_render(context):",
@@ -96,8 +109,10 @@ def _compile(template):
                 lines.append(f"    _append({node.s!r})")
         elif node_type is VariableNode:
             _emit_variable(lines, namespace, node, i)
+        elif node_type is LoadNode:
+            pass  # {% load %} affects parsing only; renders as ""
         else:
-            return None  # phase 1: fall back on any tag
+            return None  # phase 3+: fall back on any other tag
     lines.append("    return _mark_safe(''.join(_parts))")
 
     source = "\n".join(lines)
@@ -108,42 +123,9 @@ def _compile(template):
     return render
 
 
-def _emit_variable(lines, namespace, node, i):
-    """Emit code for one ``{{ ... }}`` node.
-
-    Constant-fold what is provably constant, emit the inline fast path for
-    plain lookups, and bridge everything else to the original node.
-    """
-    fe = node.filter_expression
-    var = fe.var
-    if not fe.filters:
-        if not isinstance(var, Variable):
-            # Parse-time constant, already resolved by FilterExpression
-            # (quoted literals arrive as SafeString: never escaped, not
-            # localized, so their rendering is context-independent).
-            if type(var) in (str, SafeString):
-                lines.append(f"    _append({str(var)!r})")
-                return
-            # None, or a lazy translation proxy: bridge.
-        elif var.lookups is None and not var.translate:
-            if isinstance(var.literal, str):
-                # Quoted literal, mark_safe'd at parse time: fold.
-                lines.append(f"    _append({str(var.literal)!r})")
-                return
-            # Numeric literal: rendering depends on runtime localization.
-            namespace[f"_literal_{i}"] = var.literal
-            lines.append(f"    _append(_render_value(_literal_{i}, context))")
-            return
-        elif not var.translate:
-            _emit_fast_lookup(lines, namespace, node, var.lookups, i)
-            return
-    # Everything else (filters, translation, odd parses): the original node.
-    namespace[f"_node_{i}"] = node
-    lines.append(f"    _append(_node_{i}.render(context))")
-
-
-# Generated-code templates for one lookup. These read exactly like the code
-# they emit; _emit_block() adds the function-body indent. The stanzas stay at
+# --- generated-code templates -------------------------------------------------
+# These read exactly like the code they emit; _emit_block() adds the
+# function-body indent, _indented() nests sub-blocks. Lookup stanzas stay at
 # constant depth — a step that bails sets _value = _SLOW and the later stanzas
 # skip themselves — so any number of lookup bits nests no deeper than this.
 
@@ -165,13 +147,10 @@ _LOOKUP_STEP = """\
             _value = _SLOW
 """
 
-# except clauses: the tuple Variable._resolve_lookup catches, then its
-# catch-all (exceptions flagged silent_variable_failure render as
-# string_if_invalid via the slow-path replay; everything else propagates,
-# as Django re-raises). The tail inlines render_value_in_context for the two
-# overwhelmingly common, provably identical types; everything else goes
-# through the real thing.
-_LOOKUP_FINISH = """\
+# The tuple Variable._resolve_lookup catches, then its catch-all (exceptions
+# flagged silent_variable_failure render as string_if_invalid via the
+# slow-path replay; everything else propagates, as Django re-raises).
+_LOOKUP_EXCEPT = """\
 except _LOOKUP_EXC:
     _value = _SLOW
 except Exception as _exc:
@@ -179,35 +158,163 @@ except Exception as _exc:
         _value = _SLOW
     else:
         raise
+"""
+
+# Inlines render_value_in_context for the two overwhelmingly common, provably
+# identical types; everything else goes through the real thing.
+_OUTPUT = """\
+_value_type = _value.__class__
+if _value_type is str:
+    _append(_escape(_value) if _autoescape else _value)
+elif _value_type is _SafeString:
+    _append(_value)
+else:
+    _append(_render_value(_value, context))
+"""
+
+# VariableNode.render turns a UnicodeDecodeError from FilterExpression.resolve
+# (which the filter chain is part of) into empty output.
+_APPLY_FILTERS = """\
+try:
+{filters}\
+except UnicodeDecodeError:
+    pass
+else:
+{output}\
+"""
+
+_SLOW_OR_ELSE = """\
 if _value is _SLOW:
     _append(_node_{i}.render(context))
 else:
-    _value_type = _value.__class__
-    if _value_type is str:
-        _append(_escape(_value) if _autoescape else _value)
-    elif _value_type is _SafeString:
-        _append(_value)
-    else:
-        _append(_render_value(_value, context))
+{body}\
 """
+
+
+def _indented(block, depth=1):
+    pad = "    " * depth
+    return "".join(pad + line + "\n" for line in block.splitlines())
 
 
 def _emit_block(lines, block):
     lines.extend("    " + line for line in block.splitlines())
 
 
-def _emit_fast_lookup(lines, namespace, node, lookups, i):
-    """Inline the success path of ``Variable._resolve_lookup``.
+def _emit_variable(lines, namespace, node, i):
+    """Emit code for one ``{{ ... }}`` node.
 
-    The first bit resolves against the Context (only dict-stack lookup can
-    succeed there, so ``context[bit]`` is exact); later bits follow the
-    templates above. Any lookup failure, and any callable result (Django may
-    call it, substitute ``string_if_invalid``, or leave it), defers to the
-    original node.
+    Constant-fold what is provably constant, emit the inline fast path for
+    plain lookups and direct calls for filters, and bridge everything else
+    to the original node.
     """
-    namespace[f"_node_{i}"] = node
-    first, *rest = lookups
-    _emit_block(lines, _LOOKUP_FIRST.format(bit=first))
-    for bit in rest:
-        _emit_block(lines, _LOOKUP_STEP.format(bit=bit))
-    _emit_block(lines, _LOOKUP_FINISH.format(i=i))
+    fe = node.filter_expression
+    var = fe.var
+
+    # The value ahead of any filters: a constant assignment, or the inline
+    # lookup (`guarded`: _value may be _SLOW and need the original node).
+    guarded = False
+    if isinstance(var, Variable) and not var.translate:
+        if var.lookups is None:
+            if not fe.filters:
+                if isinstance(var.literal, str):
+                    # Quoted literal, mark_safe'd at parse time: fold.
+                    lines.append(f"    _append({str(var.literal)!r})")
+                else:
+                    # Numeric literal: rendering depends on localization.
+                    namespace[f"_literal_{i}"] = var.literal
+                    lines.append(f"    _append(_render_value(_literal_{i}, context))")
+                return
+            namespace[f"_literal_{i}"] = var.literal
+            setup = f"_value = _literal_{i}\n"
+        else:
+            first, *rest = var.lookups
+            setup = _LOOKUP_FIRST.format(bit=first)
+            for bit in rest:
+                setup += _LOOKUP_STEP.format(bit=bit)
+            setup += _LOOKUP_EXCEPT
+            guarded = True
+    elif not isinstance(var, Variable) and fe.filters:
+        # Parse-time constant (SafeString, or a lazy i18n proxy that must
+        # keep translating per render): pass to the filters as-is.
+        namespace[f"_literal_{i}"] = var
+        setup = f"_value = _literal_{i}\n"
+    elif not isinstance(var, Variable) and type(var) in (str, SafeString):
+        # Constant with no filters: never escaped, not localized -> fold.
+        lines.append(f"    _append({str(var)!r})")
+        return
+    else:
+        # translate flag, or odd parses (e.g. constant that resolved to
+        # None): the original node.
+        namespace[f"_node_{i}"] = node
+        lines.append(f"    _append(_node_{i}.render(context))")
+        return
+
+    if fe.filters:
+        filters = "".join(
+            _filter_call(namespace, func, args, i, j)
+            for j, (func, args) in enumerate(fe.filters)
+        )
+        body = _APPLY_FILTERS.format(
+            filters=_indented(filters), output=_indented(_OUTPUT)
+        )
+    else:
+        body = _OUTPUT
+
+    if guarded:
+        namespace[f"_node_{i}"] = node
+        block = setup + _SLOW_OR_ELSE.format(i=i, body=_indented(body))
+    else:
+        block = setup + body
+    _emit_block(lines, block)
+
+
+def _filter_call(namespace, func, args, i, j):
+    """One filter application, mirroring FilterExpression.resolve's loop.
+
+    The behavior flags Django reads per render are constant per function,
+    so the specialization happens here, at compile time.
+    """
+    filter_name = f"_filter_{i}_{j}"
+    namespace[filter_name] = func
+    is_safe = getattr(func, "is_safe", False)
+    # is_safe needs the filter's *input* around after the call, to decide
+    # whether the result inherits its safety.
+    input_name = "_input" if is_safe else "_value"
+    call_args = [input_name]
+    for k, (is_lookup, arg) in enumerate(args):
+        arg_name = f"_arg_{i}_{j}_{k}"
+        if not is_lookup:
+            if isinstance(arg, str):
+                # mark_safe of a plain/Safe str is deterministic: fold.
+                namespace[arg_name] = mark_safe(arg)
+                call_args.append(arg_name)
+            else:
+                # Lazy i18n constant: translation happens per render.
+                namespace[arg_name] = arg
+                call_args.append(f"_mark_safe({arg_name})")
+        elif arg.lookups is None and not arg.translate:
+            namespace[arg_name] = arg.literal
+            call_args.append(arg_name)
+        else:
+            # Django's own Variable.resolve, failures and all (a missing
+            # filter argument raises VariableDoesNotExist, unlike a missing
+            # variable ahead of the filters).
+            namespace[arg_name] = arg
+            call_args.append(f"{arg_name}.resolve(context)")
+    if getattr(func, "needs_autoescape", False):
+        call_args.append("autoescape=_autoescape")
+    call = f"{filter_name}({', '.join(call_args)})"
+
+    block = ""
+    if getattr(func, "expects_localtime", False):
+        block += "_value = _template_localtime(_value, context.use_tz)\n"
+    if is_safe:
+        block += (
+            f"_input = _value\n"
+            f"_value = {call}\n"
+            "if isinstance(_input, _SafeData):\n"
+            "    _value = _mark_safe(_value)\n"
+        )
+    else:
+        block += f"_value = {call}\n"
+    return block
