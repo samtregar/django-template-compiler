@@ -43,9 +43,13 @@ stats = {
 # a cached loader hand out a *fresh* Template instance per load; without this
 # second-level cache every {% extends %}/{% include %} target would recompile
 # on every render (measured 3x slower than stock, vs the intended speedup).
-# Keyed by name+source per engine, so it is exactly as correct as the parse
-# itself; from_string templates (no loader name) skip it to avoid unbounded
-# growth on user-generated template strings.
+# Keyed by name+source per engine; from_string templates (no loader name)
+# skip it to avoid unbounded growth on user-generated template strings.
+# Only functions marked __dtc_shareable__ are stored: a function embedding
+# bridged nodes must stay per-parse, because Django gives each parse its own
+# node instances and stateful nodes (IfChangedNode, CycleNode) key state by
+# node identity — sharing would merge state Django keeps separate (caught by
+# template_tests.test_if_changed.test_include_state).
 _source_cache = weakref.WeakKeyDictionary()
 
 
@@ -69,7 +73,7 @@ def compiled_for(template):
 
     compiled = compile_template(template)  # fail-open: None on error
     template._dtc_compiled = compiled
-    if engine_cache is not None:
+    if engine_cache is not None and getattr(compiled, "__dtc_shareable__", True):
         engine_cache[(origin_name, template.source)] = compiled
     key = "templates_compiled" if compiled is not None else "templates_fallback"
     stats[key] += 1

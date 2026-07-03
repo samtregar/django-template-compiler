@@ -1,11 +1,15 @@
 """Compile parsed Django templates to Python.
 
-Phases 1–3: templates consisting of text, ``{{ variables }}`` (with
-filters), ``{% if %}``, ``{% for %}``, ``{% with %}``,
-``{% autoescape %}``, ``{% comment %}``, ``{% verbatim %}``, and
-``{% load %}`` compile to a generated Python function; any other tag makes
-``compile_template`` return ``None`` and the backend falls back to Django's
-interpreted renderer.
+Every parseable template compiles (phases 1–5): text, ``{{ variables }}``
+(with filters), ``{% if %}``, ``{% for %}``, ``{% with %}``,
+``{% autoescape %}``, ``{% comment %}``, ``{% verbatim %}``,
+``{% load %}``, inheritance (``{% block %}``/``{% extends %}``/
+``{% include %}``), and ``@simple_tag``/``@inclusion_tag`` nodes get
+dedicated code generation; any other node — third-party tags included —
+bridges as ``node.render_annotated(context)`` against the live context,
+which is exact because compiled code performs real context operations.
+``compile_template`` returns ``None`` only for debug engines and on
+internal compiler errors (fail-open).
 
 The compiled function replaces ``Template._render`` — it receives a fully
 bound ``Context`` (the caller reproduces ``Template.render``'s
@@ -70,8 +74,10 @@ from django.template.defaulttags import (
     VerbatimNode,
     WithNode,
 )
+from django.template.base import Template as BaseTemplate
+from django.template.library import InclusionNode, SimpleNode
 from django.template.loader_tags import BlockNode, ExtendsNode, IncludeNode
-from django.utils.html import escape
+from django.utils.html import conditional_escape, escape
 from django.utils.safestring import SafeData, SafeString, mark_safe
 from django.utils.timezone import template_localtime
 
@@ -92,10 +98,6 @@ class _Slow:
 
 
 _SLOW = _Slow()
-
-
-class _Uncompilable(Exception):
-    """Raised by the analysis pass on any construct we can't compile yet."""
 
 
 def _unpack_loop_item(loopvars, item):
@@ -127,8 +129,6 @@ def compile_template(template):
         return None
     try:
         return _compile(template)
-    except _Uncompilable:
-        return None
     except Exception:
         # A compiler bug must never break rendering; fall back to Django.
         logger.exception("dtc failed to compile %r; falling back", template.name)
@@ -171,18 +171,19 @@ def _compile(template):
         node._dtc_body = codegen.namespace[name]
     render = codegen.namespace["_dtc_render"]
     render.__dtc_source__ = source
+    render.__dtc_shareable__ = not codegen.uses_bridges
     return render
 
 
 # --- analysis pass ------------------------------------------------------------
-# One walk over the tree: validates that every node is a type we compile
-# (anything else raises _Uncompilable) and collects the first bit of every
-# Variable the template can ever resolve. For a template with no inheritance
-# nodes that enumeration is complete, which is what makes "skip forloop
-# maintenance when 'forloop' is never referenced" exact. A {% block %} or
-# {% include %} *inside a loop* renders content this template can't see (a
-# child's override, another template) which may reference forloop — those
-# force maintenance on.
+# One walk over the tree, collecting the first bit of every Variable the
+# template can ever resolve. For known node types that enumeration is
+# complete, which is what makes "skip forloop maintenance when 'forloop' is
+# never referenced" exact. Constructs that render content this template
+# can't see — a {% block %} override, an {% include %}d template, a bridged
+# unknown tag, a takes_context simple_tag — force maintenance on when they
+# sit inside a loop: they may read forloop, and some (IfChangedNode) even
+# use the forloop dict itself as their loop-scope state marker.
 
 
 class _Analysis:
@@ -216,23 +217,24 @@ class _Analysis:
             elif node_type is BlockNode:
                 if in_loop:
                     self.force_forloop = True
-                # Body compilation is best-effort (an uncompilable body
-                # renders interpreted through render_block).
-                self._best_effort(node.nodelist, in_loop)
+                self.walk(node.nodelist, in_loop)
             elif node_type is IncludeNode:
                 if in_loop:
                     self.force_forloop = True
-            elif node_type is ExtendsNode:
-                for block in node.blocks.values():
-                    self._best_effort(block.nodelist, False)
+            elif node_type in (SimpleNode, InclusionNode):
+                # Arguments resolve in the outer context; a takes_context
+                # function can read anything. (InclusionNode renders its
+                # template with context.new() — isolated — so the template
+                # itself can't see forloop.)
+                for fe in list(node.args) + list(node.kwargs.values()):
+                    self._fe(fe)
+                if node_type is SimpleNode and node.takes_context and in_loop:
+                    self.force_forloop = True
             else:
-                raise _Uncompilable(node_type.__name__)
-
-    def _best_effort(self, nodelist, in_loop):
-        try:
-            self.walk(nodelist, in_loop)
-        except _Uncompilable:
-            pass
+                # Unknown node: bridged at codegen. Its render can read
+                # anything from the live context.
+                if in_loop:
+                    self.force_forloop = True
 
     def _fe(self, fe):
         if isinstance(fe.var, Variable) and fe.var.lookups:
@@ -395,11 +397,14 @@ class _Codegen:
             "_render_block": runtime.render_block,
             "_render_extends": runtime.render_extends,
             "_render_include": runtime.render_include,
+            "_template_render": runtime.template_render,
+            "_conditional_escape": conditional_escape,
         }
         self._ids = itertools.count()
         self.block_defs = []  # (function name, body) per compiled block
         self.block_attach = []  # (BlockNode, function name) to bind after exec
         self._blocks_seen = set()
+        self.uses_bridges = False
 
     def uid(self):
         return next(self._ids)
@@ -410,9 +415,24 @@ class _Codegen:
 
     def visit(self, node):
         handler = self._handlers.get(type(node))
-        if handler is None:  # reachable via best-effort block bodies
-            raise _Uncompilable(type(node).__name__)
+        if handler is None:
+            return self.visit_bridge(node)
         return handler(self, node)
+
+    def visit_bridge(self, node):
+        """Any node type we don't compile runs as itself against the live
+        context — exact because compiled code maintains a real Context and
+        render_context. render_annotated (not render) honors third-party
+        overrides; in non-debug engines the default implementation is a
+        plain passthrough to render, matching NodeList.render."""
+        i = self.uid()
+        self.namespace[f"_node_{i}"] = node
+        # Bridged nodes may keep per-node state keyed by their own identity
+        # (IfChangedNode, CycleNode, ...). Embedding one makes this compiled
+        # function specific to this parse: it must not be shared across
+        # same-source template instances (see runtime.compiled_for).
+        self.uses_bridges = True
+        return f"_append(_node_{i}.render_annotated(context))\n"
 
     # --- leaves ---------------------------------------------------------
 
@@ -660,20 +680,98 @@ class _Codegen:
         return f"_append(_render_include(_node_{i}, context))\n"
 
     def _compile_block_body(self, node):
-        """Best-effort: a block whose body we can't compile still works —
-        render_block falls back to its nodelist. node.blocks of an
-        ExtendsNode includes nested blocks, and visiting an outer body
-        compiles inner ones, hence the seen-guard."""
+        """node.blocks of an ExtendsNode includes nested blocks, and
+        visiting an outer body compiles inner ones, hence the seen-guard."""
         if id(node) in self._blocks_seen:
             return
         self._blocks_seen.add(id(node))
-        try:
-            body = self.nodelist_block(node.nodelist)
-        except _Uncompilable:
-            return
+        body = self.nodelist_block(node.nodelist)
         name = f"_dtc_block_{self.uid()}"
         self.block_defs.append((name, body))
         self.block_attach.append((node, name))
+
+    # --- custom tag helpers (simple_tag / inclusion_tag) -------------------
+
+    def _tag_call(self, node, i):
+        """Build the generated call to a TagHelperNode's function, mirroring
+        get_resolved_arguments: constant arguments fold, the rest resolve
+        through Django's own FilterExpressions. kwargs go through a dict
+        splat — parse_bits allows any \\w+ name for **kwargs functions,
+        including Python keywords."""
+        func_name = f"_tag_{i}"
+        self.namespace[func_name] = node.func
+        call_args = ["context"] if node.takes_context else []
+        for k, fe in enumerate(node.args):
+            call_args.append(self._arg_expr(fe, f"_targ_{i}_{k}"))
+        if node.kwargs:
+            items = ", ".join(
+                f"{key!r}: {self._arg_expr(fe, f'_tkwarg_{i}_{k}')}"
+                for k, (key, fe) in enumerate(node.kwargs.items())
+            )
+            call_args.append(f"**{{{items}}}")
+        return f"{func_name}({', '.join(call_args)})"
+
+    def _arg_expr(self, fe, name):
+        """An expression for one FilterExpression argument: folded when its
+        resolution is provably context-independent."""
+        var = fe.var
+        if not fe.filters:
+            if not isinstance(var, Variable):
+                if isinstance(var, str):  # parse-time constant
+                    self.namespace[name] = var
+                    return name
+            elif var.lookups is None and not var.translate:
+                self.namespace[name] = var.literal
+                return name
+        self.namespace[name] = fe
+        return f"{name}.resolve(context)"
+
+    def visit_simple(self, node):
+        """SimpleNode.render, specialized at compile time (verified
+        identical across Django 4.2–5.2): argument resolution inlined,
+        target_var/autoescape branches decided now."""
+        i = self.uid()
+        call = self._tag_call(node, i)
+        if node.target_var is not None:
+            return f"context[{node.target_var!r}] = {call}\n"
+        return (
+            f"_value = {call}\n"
+            "if _autoescape:\n"
+            "    _value = _conditional_escape(_value)\n"
+            "_append(_value)\n"
+        )
+
+    def visit_inclusion(self, node):
+        """InclusionNode.render with the template-render call made
+        compiled-aware. Only emitted when the filename form is known at
+        compile time (str, Template, or a backend template) — the exotic
+        iterable-of-names form bridges, which also sidesteps the one line
+        of this method that differs between Django 4.2 and 5.2."""
+        i = self.uid()
+        filename = node.filename
+        if isinstance(filename, str):
+            resolve = f"    _incl_t = context.template.engine.get_template({filename!r})\n"
+        elif isinstance(filename, BaseTemplate):
+            self.namespace[f"_incl_file_{i}"] = filename
+            resolve = f"    _incl_t = _incl_file_{i}\n"
+        elif isinstance(getattr(filename, "template", None), BaseTemplate):
+            self.namespace[f"_incl_file_{i}"] = filename.template
+            resolve = f"    _incl_t = _incl_file_{i}\n"
+        else:
+            return self.visit_bridge(node)
+        self.namespace[f"_node_{i}"] = node
+        return (
+            f"_incl_dict = {self._tag_call(node, i)}\n"
+            f"_incl_t = context.render_context.get(_node_{i})\n"
+            "if _incl_t is None:\n"
+            + resolve
+            + f"    context.render_context[_node_{i}] = _incl_t\n"
+            "_incl_ctx = context.new(_incl_dict)\n"
+            "_csrf = context.get('csrf_token')\n"
+            "if _csrf is not None:\n"
+            "    _incl_ctx['csrf_token'] = _csrf\n"
+            "_append(_template_render(_incl_t, _incl_ctx))\n"
+        )
 
     _handlers = {
         TextNode: visit_text,
@@ -688,4 +786,6 @@ class _Codegen:
         BlockNode: visit_block,
         ExtendsNode: visit_extends,
         IncludeNode: visit_include,
+        SimpleNode: visit_simple,
+        InclusionNode: visit_inclusion,
     }

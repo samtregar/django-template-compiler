@@ -42,6 +42,47 @@ def crash(value):
     raise RuntimeError("filter boom")
 
 
+@register.simple_tag
+def stamp(prefix, times=1):
+    return f"<{prefix * times}>"
+
+
+@register.simple_tag(takes_context=True)
+def ctx_reader(context, key):
+    return f"[{context.get(key, 'absent')}]"
+
+
+@register.simple_tag
+def kw_any(**kwargs):
+    return ";".join(f"{k}={v}" for k, v in sorted(kwargs.items()))
+
+
+@register.inclusion_tag("inc_tag.html")
+def card(label, value="?"):
+    return {"label": label, "value": value}
+
+
+@register.inclusion_tag("inc_tag.html", takes_context=True)
+def card_ctx(context):
+    return {"label": "from-ctx", "value": context.get("name", "?")}
+
+
+class ContextPokeNode(template.Node):
+    """A raw third-party-style node: mutates the live context."""
+
+    def __init__(self, var_name):
+        self.var_name = var_name
+
+    def render(self, context):
+        context[self.var_name] = "poked"
+        return "<poke>"
+
+
+@register.tag
+def poke(parser, token):
+    return ContextPokeNode(token.split_contents()[1])
+
+
 def make_backend(cls, **options):
     return cls(
         {

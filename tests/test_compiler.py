@@ -119,6 +119,13 @@ def base_context():
         "empty_list": [],
         "pairs": [("a", 1), ("b", 2)],
         "gen": NoLen(),
+        "repeats": ["a", "a", "b", "b", "b", "c"],
+        "prefix": "<pre>",
+        "people": [
+            {"name": "ann", "team": "red"},
+            {"name": "bob", "team": "red"},
+            {"name": "cat", "team": "blue"},
+        ],
     }
 
 
@@ -254,6 +261,31 @@ CASES = [
     "{% for x in gen %}{{ x }}{% endfor %}",  # no __len__ -> list()
     # inner loop shadows outer loop var; outer scope restores after pop
     "{% for x in items %}{% for x in pairs %}{{ x.0 }}{% endfor %}{{ x }}|{% endfor %}",
+    # phase 5: built-in tags without dedicated codegen bridge per-node
+    "a{% now 'Y' %}b{{ name }}",
+    "{% for x in items %}{% cycle 'odd' 'even' %}:{{ x }} {% endfor %}",
+    "{% for x in repeats %}{% ifchanged x %}new:{{ x }}{% endifchanged %}.{% endfor %}"
+    "{% for x in repeats %}{% ifchanged x %}again:{{ x }}{% endifchanged %}.{% endfor %}",
+    "{% firstof missing none b 'fallback<' %}",
+    "{% firstof missing as fo %}[{{ fo }}]",
+    "{% spaceless %}<p> <a>{{ name }}</a> </p>{% endspaceless %}",
+    "{% widthratio n 100 10 %}",
+    "{% templatetag openblock %}x{% templatetag closevariable %}",
+    "{% filter upper|lower %}Mixed {{ name }}{% endfilter %}",
+    "{% regroup people by team as teams %}{% for t in teams %}{{ t.grouper }}:"
+    "{% for p in t.list %}{{ p.name }},{% endfor %};{% endfor %}",
+    "{% lorem 5 w %}",
+    # phase 5: custom simple_tags compile natively
+    "{% stamp name %} {% stamp name 2 %} {% stamp prefix=html times=2 %}",
+    "{% stamp name|upper %}",  # filtered argument
+    "{% stamp 'const' 3 %}",  # foldable arguments
+    "{% stamp name as st %}[{{ st }}]",  # target_var
+    "{% ctx_reader 'name' %} {% ctx_reader 'missing' %}",
+    "{% kw_any b=2 a=name class='x' %}",  # keyword-named kwarg via **kwargs
+    "{% for x in items %}{% ctx_reader 'forloop' %}{% endfor %}",  # forces forloop
+    # phase 5: raw third-party node mutating the live context
+    "{% poke stamped %}{{ stamped }}",
+    "{% for x in items %}{% poke inner %}{{ inner }}{% endfor %}",
 ]
 
 
@@ -368,6 +400,18 @@ INHERITANCE_TEMPLATES = {
         "{% block inner %}override{% endblock %}"
     ),
     "inc.html": "inc:{{ name }}/{{ extra }};",
+    "inc_tag.html": "<card>{{ label }}={{ value }}|csrf:{{ csrf_token }}</card>",
+    "ifchanged_inc.html": "{% ifchanged x %}{{ x }}{% endifchanged %}",
+    "main_ifchanged_state.html": (
+        # Two IncludeNodes: each loads its own parse of ifchanged_inc.html,
+        # whose IfChangedNode state must stay independent (Django #27974).
+        "{% for x in numbers %}{% include 'ifchanged_inc.html' %}"
+        "{% include 'ifchanged_inc.html' %}{% endfor %}"
+    ),
+    "main_cards.html": (
+        "{% card 'a' %}{% card name value=html %}{% card_ctx %}"
+        "{% for x in items %}{% card x value=forloop.counter %}{% endfor %}"
+    ),
     "inc_forloop.html": "({{ forloop.counter }}:{{ x }})",
     "main_inc.html": "{% include 'inc.html' %}",
     "main_inc_with.html": "{% include 'inc.html' with extra='E<' %}",
@@ -393,6 +437,7 @@ INHERITANCE_TEMPLATES = {
         "main_inc_with.html",
         "main_inc_only.html",
         "main_inc_loop.html",
+        "main_cards.html",
     ],
 )
 def test_differential_inheritance(name):
@@ -435,6 +480,34 @@ def test_forloop_forced_by_block_in_loop():
     }
     template = make_backend(DTCTemplates, **options).get_template("base_loop.html")
     assert "'parentloop'" in template._compiled.__dtc_source__
+
+
+def test_inclusion_tag_csrf_copied():
+    """InclusionNode copies csrf_token into the isolated context."""
+    context = dict(base_context(), csrf_token="fixed-token-value")
+    _, out = render_named_both(INHERITANCE_TEMPLATES, "main_cards.html", context)
+    assert "csrf:fixed-token-value" in out
+
+
+def test_ifchanged_state_independent_across_includes():
+    """Regression (caught by Django's suite): sharing a compiled fn across
+    same-source template instances aliased their bridged stateful nodes."""
+    context = dict(base_context(), numbers=[1, 2, 3])
+    _, out = render_named_both(
+        INHERITANCE_TEMPLATES, "main_ifchanged_state.html", context
+    )
+    assert out == "112233"
+
+
+def test_bridged_templates_not_shared():
+    options = {
+        "loaders": [("django.template.loaders.locmem.Loader", INHERITANCE_TEMPLATES)]
+    }
+    backend = make_backend(DTCTemplates, **options)
+    first = backend.get_template("ifchanged_inc.html")
+    second = backend.get_template("ifchanged_inc.html")
+    assert first._compiled is not second._compiled  # per-parse: embeds state
+    assert not first._compiled.__dtc_shareable__
 
 
 def test_source_cache_reuses_compiled_fn():
@@ -522,9 +595,12 @@ def test_forloop_maintained_when_referenced():
     assert "enumerate" in source
 
 
-def test_tags_fall_back():
+def test_unknown_tags_bridge():
+    """Since phase 5, unknown tags compile as per-node bridges instead of
+    forcing whole-template fallback."""
     template = make_backend(DTCTemplates).from_string("{% now 'Y' %}")
-    assert template._compiled is None
+    assert template._compiled is not None
+    assert ".render_annotated(context)" in template._compiled.__dtc_source__
 
 
 def test_debug_engine_falls_back():

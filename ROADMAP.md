@@ -167,6 +167,23 @@ visible to compiled code and vice versa).
   is now a node, not a template. This is the coverage cliff; after phase 5,
   real apps run mostly-compiled.
 
+Status: **complete.** Unknown nodes bridge as `render_annotated(context)`
+against the live context (exact per the phase 3 scoping decision);
+whole-template fallback remains only for debug engines. `@simple_tag`
+compiles to a direct function call (argument resolution inlined, constants
+folded, `target_var`/autoescape decided at compile time — verified identical
+across 4.2–5.2); `@inclusion_tag` gets the mirror-with-compiled-render
+treatment when its filename form is compile-time known, so inclusion
+templates render compiled. Analysis force-rules extended: bridged nodes and
+`takes_context` simple_tags inside a loop disable `forloop` elision —
+IfChangedNode even uses the forloop dict as its state frame. The oracle
+caught a second source-cache bug: compiled functions embedding bridged
+nodes must not be shared across same-source template instances, because
+stateful nodes key state by node identity (Django #27974 semantics);
+`__dtc_shareable__` now gates the cache. Both suites pass; compiled
+coverage grew to ~2100 templates (everything except debug engines). The
+old whole-template worst case improved 1.00x → 1.23x.
+
 ## Phase 6 — Long tail of built-ins
 
 Dedicated codegen (or verified bridging where codegen isn't worth it) for the

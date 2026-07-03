@@ -79,10 +79,10 @@ def scenarios():
         "{% endwith %}{% endfor %}",
         {"rows": [f"row {i}" for i in range(50)]},
     )
-    # An uncompilable tag forces whole-template fallback: the floor is
-    # "no slower than stock", not a speedup.
+    # A tag without dedicated codegen bridges per-node; the surrounding
+    # variables still compile. The floor is "no slower than stock".
     yield (
-        "tag_fallback (worst case)",
+        "tag_bridged (worst case)",
         "{% now 'Y' %} " + " ".join("{{ v%d }}" % i for i in range(10)),
         {f"v{i}": f"value {i}" for i in range(10)},
     )
@@ -156,8 +156,7 @@ def main():
     for name, source, context in scenarios():
         dtc_template = dtc_backend.from_string(source)
         django_template = django_backend.from_string(source)
-        if "fallback" not in name:
-            assert dtc_template._compiled is not None, f"{name} did not compile"
+        assert dtc_template._compiled is not None, f"{name} did not compile"
         assert dtc_template.render(dict(context)) == django_template.render(
             dict(context)
         ), f"{name} output mismatch"
