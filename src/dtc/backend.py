@@ -27,7 +27,7 @@ from django.template.backends.django import (
 )
 from django.template.context import make_context
 
-from .compiler import compile_template
+from .runtime import compiled_for, template_render
 
 
 class DTCTemplates(DjangoTemplates):
@@ -54,25 +54,14 @@ class Template(DjangoTemplateProxy):
 
     def __init__(self, template, backend):
         super().__init__(template, backend)
-        self._compiled = compile_template(template)
+        self._compiled = compiled_for(template)  # instance-cached
 
     def render(self, context=None, request=None):
-        compiled = self._compiled
-        if compiled is None:
-            return super().render(context=context, request=request)
         context = make_context(
             context, request, autoescape=self.backend.engine.autoescape
         )
-        # Reproduce django.template.base.Template.render exactly: the
-        # compiled function replaces _render, but the render_context state
-        # push and template binding (which runs context processors on
-        # RequestContext and exposes context.template.engine to nodes) are
-        # still Django's observable semantics.
-        template = self.template
-        with context.render_context.push_state(template):
-            if context.template is None:
-                with context.bind_template(template):
-                    context.template_name = template.name
-                    return compiled(context)
-            else:
-                return compiled(context)
+        # template_render reproduces django.template.base.Template.render
+        # exactly around the compiled body (render_context push, template
+        # binding — which runs context processors on RequestContext), and
+        # falls back to Django's own render when not compiled.
+        return template_render(self.template, context)

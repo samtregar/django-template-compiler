@@ -1,7 +1,8 @@
 """Engine-level instrumentation: compile every ``django.template.base.Template``.
 
 ``install()`` patches ``Template._render`` to try the dtc-compiled path with
-lazy per-instance compilation, falling back to Django's interpreted renderer.
+lazy per-instance compilation (shared with the rest of dtc via
+``runtime.compiled_for``), falling back to Django's interpreted renderer.
 This hooks the *engine* level rather than the BACKENDS proxy, so it also
 covers templates constructed directly — which is how Django's own
 ``template_tests`` suite builds them (see ``scripts/run_django_suite.py``).
@@ -17,29 +18,9 @@ Experimental; the supported integration point is ``dtc.backend.DTCTemplates``.
 
 from __future__ import annotations
 
-from .compiler import compile_template
+from .runtime import compiled_for, stats
 
-_MISSING = object()
 _installed = False
-
-#: Render/compile counters, so suite runs can prove the compiled path was
-#: actually exercised rather than silently falling back everywhere.
-stats = {
-    "templates_compiled": 0,
-    "templates_fallback": 0,
-    "renders_compiled": 0,
-    "renders_fallback": 0,
-}
-
-
-def _compiled_for(template):
-    compiled = template.__dict__.get("_dtc_compiled", _MISSING)
-    if compiled is _MISSING:
-        compiled = compile_template(template)  # fail-open: returns None on error
-        template._dtc_compiled = compiled
-        key = "templates_compiled" if compiled is not None else "templates_fallback"
-        stats[key] += 1
-    return compiled
 
 
 def install():
@@ -55,7 +36,7 @@ def install():
     orig_render = Template._render
 
     def _render(self, context):
-        compiled = _compiled_for(self)
+        compiled = compiled_for(self)
         if compiled is None:
             stats["renders_fallback"] += 1
             return orig_render(self, context)
@@ -68,7 +49,7 @@ def install():
         # Byte-for-byte what django.test.utils.instrumented_test_render does,
         # with the nodelist render swapped for compiled-or-fallback.
         template_rendered.send(sender=self, template=self, context=context)
-        compiled = _compiled_for(self)
+        compiled = compiled_for(self)
         if compiled is None:
             stats["renders_fallback"] += 1
             return self.nodelist.render(context)

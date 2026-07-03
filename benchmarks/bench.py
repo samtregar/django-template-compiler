@@ -88,6 +88,35 @@ def scenarios():
     )
 
 
+INHERITANCE_TEMPLATES = {
+    "bench_base.html": (
+        "<html><head><title>{% block title %}t{% endblock %}</title></head>"
+        "<body><nav>{% block nav %}{% for s in sections %}<a>{{ s }}</a>"
+        "{% endfor %}{% endblock %}</nav>"
+        "<main>{% block content %}{% endblock %}</main></body></html>"
+    ),
+    "bench_child.html": (
+        "{% extends 'bench_base.html' %}"
+        "{% block title %}{{ title }} | {{ block.super }}{% endblock %}"
+        "{% block content %}{% for row in rows %}"
+        "<p>{% include 'bench_item.html' %}</p>{% endfor %}{% endblock %}"
+    ),
+    "bench_item.html": "<b>{{ row }}</b> in {{ title }}",
+}
+
+
+def inheritance_scenario():
+    return (
+        "inheritance (extends + include in loop)",
+        "bench_child.html",
+        {
+            "title": "Page",
+            "sections": ["a", "b", "c"],
+            "rows": [f"row {i}" for i in range(20)],
+        },
+    )
+
+
 def bench(template, context):
     timer = timeit.Timer(lambda: template.render(dict(context)))
     number, _ = timer.autorange()
@@ -95,7 +124,28 @@ def bench(template, context):
 
 
 def make_backend(cls):
-    return cls({"NAME": "bench", "DIRS": [], "APP_DIRS": False, "OPTIONS": {}})
+    return cls(
+        {
+            "NAME": "bench",
+            "DIRS": [],
+            "APP_DIRS": False,
+            "OPTIONS": {
+                # cached.Loader matches production (Django wraps DIRS/APP_DIRS
+                # loaders with it automatically when loaders aren't given).
+                "loaders": [
+                    (
+                        "django.template.loaders.cached.Loader",
+                        [
+                            (
+                                "django.template.loaders.locmem.Loader",
+                                INHERITANCE_TEMPLATES,
+                            )
+                        ],
+                    )
+                ]
+            },
+        }
+    )
 
 
 def main():
@@ -117,6 +167,18 @@ def main():
             f"{name:38} {django_time * 1e6:8.1f}us {dtc_time * 1e6:8.1f}us"
             f" {django_time / dtc_time:8.2f}x"
         )
+
+    name, template_name, context = inheritance_scenario()
+    dtc_template = dtc_backend.get_template(template_name)
+    django_template = django_backend.get_template(template_name)
+    assert dtc_template._compiled is not None, f"{name} did not compile"
+    assert dtc_template.render(dict(context)) == django_template.render(dict(context))
+    django_time = bench(django_template, context)
+    dtc_time = bench(dtc_template, context)
+    print(
+        f"{name:38} {django_time * 1e6:8.1f}us {dtc_time * 1e6:8.1f}us"
+        f" {django_time / dtc_time:8.2f}x"
+    )
 
 
 if __name__ == "__main__":

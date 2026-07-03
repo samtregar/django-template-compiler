@@ -70,9 +70,12 @@ from django.template.defaulttags import (
     VerbatimNode,
     WithNode,
 )
+from django.template.loader_tags import BlockNode, ExtendsNode, IncludeNode
 from django.utils.html import escape
 from django.utils.safestring import SafeData, SafeString, mark_safe
 from django.utils.timezone import template_localtime
+
+from . import runtime
 
 logger = logging.getLogger("dtc")
 
@@ -132,24 +135,40 @@ def compile_template(template):
         return None
 
 
-def _compile(template):
-    first_bits = set()
-    _analyze(template.nodelist, first_bits)  # raises _Uncompilable
+_PREAMBLE = (
+    "    _autoescape = context.autoescape\n"
+    "    _context_get = context.__getitem__\n"
+    "    _context_set = context.__setitem__\n"
+    "    _parts = []\n"
+    "    _append = _parts.append\n"
+)
 
-    codegen = _Codegen(forloop_needed="forloop" in first_bits)
+
+def _compile(template):
+    analysis = _Analysis()
+    analysis.walk(template.nodelist)  # raises _Uncompilable
+
+    codegen = _Codegen(
+        forloop_needed="forloop" in analysis.first_bits or analysis.force_forloop
+    )
     body = codegen.nodelist_block(template.nodelist)
-    source = (
+    # Block bodies compile to standalone functions (they're invoked through
+    # BlockContext, possibly by a different template in the chain).
+    source = "".join(
+        f"def {name}(context):\n{_PREAMBLE}{_indented(block_body)}"
+        "    return _mark_safe(''.join(_parts))\n"
+        for name, block_body in codegen.block_defs
+    )
+    source += (
         "def _dtc_render(context):\n"
-        "    _autoescape = context.autoescape\n"
-        "    _context_get = context.__getitem__\n"
-        "    _context_set = context.__setitem__\n"
-        "    _parts = []\n"
-        "    _append = _parts.append\n"
+        + _PREAMBLE
         + _indented(body)
         + "    return _mark_safe(''.join(_parts))\n"
     )
     code = compile(source, f"<dtc:{template.name or 'unnamed'}>", "exec")
     exec(code, codegen.namespace)
+    for node, name in codegen.block_attach:
+        node._dtc_body = codegen.namespace[name]
     render = codegen.namespace["_dtc_render"]
     render.__dtc_source__ = source
     return render
@@ -158,54 +177,79 @@ def _compile(template):
 # --- analysis pass ------------------------------------------------------------
 # One walk over the tree: validates that every node is a type we compile
 # (anything else raises _Uncompilable) and collects the first bit of every
-# Variable the template can ever resolve. Because compiled templates contain
-# no unknown tags, this enumeration is complete — which is what makes
-# "skip forloop maintenance when 'forloop' is never referenced" exact.
+# Variable the template can ever resolve. For a template with no inheritance
+# nodes that enumeration is complete, which is what makes "skip forloop
+# maintenance when 'forloop' is never referenced" exact. A {% block %} or
+# {% include %} *inside a loop* renders content this template can't see (a
+# child's override, another template) which may reference forloop — those
+# force maintenance on.
 
 
-def _analyze(nodelist, first_bits):
-    for node in nodelist:
-        node_type = type(node)  # exact type: subclasses may change semantics
-        if node_type in (TextNode, CommentNode, VerbatimNode, LoadNode):
+class _Analysis:
+    def __init__(self):
+        self.first_bits = set()
+        self.force_forloop = False
+
+    def walk(self, nodelist, in_loop=False):
+        for node in nodelist:
+            node_type = type(node)  # exact type: subclasses change semantics
+            if node_type in (TextNode, CommentNode, VerbatimNode, LoadNode):
+                pass
+            elif node_type is VariableNode:
+                self._fe(node.filter_expression)
+            elif node_type is IfNode:
+                for condition, branch in node.conditions_nodelists:
+                    if condition is not None:
+                        self._condition(condition)
+                    self.walk(branch, in_loop)
+            elif node_type is ForNode:
+                self._fe(node.sequence)
+                self.walk(node.nodelist_loop, True)
+                # The empty branch runs outside the iteration.
+                self.walk(node.nodelist_empty, in_loop)
+            elif node_type is WithNode:
+                for fe in node.extra_context.values():
+                    self._fe(fe)
+                self.walk(node.nodelist, in_loop)
+            elif node_type is AutoEscapeControlNode:
+                self.walk(node.nodelist, in_loop)
+            elif node_type is BlockNode:
+                if in_loop:
+                    self.force_forloop = True
+                # Body compilation is best-effort (an uncompilable body
+                # renders interpreted through render_block).
+                self._best_effort(node.nodelist, in_loop)
+            elif node_type is IncludeNode:
+                if in_loop:
+                    self.force_forloop = True
+            elif node_type is ExtendsNode:
+                for block in node.blocks.values():
+                    self._best_effort(block.nodelist, False)
+            else:
+                raise _Uncompilable(node_type.__name__)
+
+    def _best_effort(self, nodelist, in_loop):
+        try:
+            self.walk(nodelist, in_loop)
+        except _Uncompilable:
             pass
-        elif node_type is VariableNode:
-            _bits_from_fe(node.filter_expression, first_bits)
-        elif node_type is IfNode:
-            for condition, branch in node.conditions_nodelists:
-                if condition is not None:
-                    _bits_from_condition(condition, first_bits)
-                _analyze(branch, first_bits)
-        elif node_type is ForNode:
-            _bits_from_fe(node.sequence, first_bits)
-            _analyze(node.nodelist_loop, first_bits)
-            _analyze(node.nodelist_empty, first_bits)
-        elif node_type is WithNode:
-            for fe in node.extra_context.values():
-                _bits_from_fe(fe, first_bits)
-            _analyze(node.nodelist, first_bits)
-        elif node_type is AutoEscapeControlNode:
-            _analyze(node.nodelist, first_bits)
-        else:
-            raise _Uncompilable(node_type.__name__)
 
+    def _fe(self, fe):
+        if isinstance(fe.var, Variable) and fe.var.lookups:
+            self.first_bits.add(fe.var.lookups[0])
+        for _func, args in fe.filters:
+            for is_lookup, arg in args:
+                if is_lookup and isinstance(arg, Variable) and arg.lookups:
+                    self.first_bits.add(arg.lookups[0])
 
-def _bits_from_fe(fe, first_bits):
-    if isinstance(fe.var, Variable) and fe.var.lookups:
-        first_bits.add(fe.var.lookups[0])
-    for _func, args in fe.filters:
-        for is_lookup, arg in args:
-            if is_lookup and isinstance(arg, Variable) and arg.lookups:
-                first_bits.add(arg.lookups[0])
-
-
-def _bits_from_condition(condition, first_bits):
-    value = getattr(condition, "value", None)  # TemplateLiteral leaf
-    if value is not None:
-        _bits_from_fe(value, first_bits)
-    for attr in ("first", "second"):  # smartif operator children
-        child = getattr(condition, attr, None)
-        if child is not None:
-            _bits_from_condition(child, first_bits)
+    def _condition(self, condition):
+        value = getattr(condition, "value", None)  # TemplateLiteral leaf
+        if value is not None:
+            self._fe(value)
+        for attr in ("first", "second"):  # smartif operator children
+            child = getattr(condition, attr, None)
+            if child is not None:
+                self._condition(child)
 
 
 # --- generated-code templates -------------------------------------------------
@@ -348,8 +392,14 @@ class _Codegen:
             "_template_localtime": template_localtime,
             "_VariableDoesNotExist": VariableDoesNotExist,
             "_unpack": _unpack_loop_item,
+            "_render_block": runtime.render_block,
+            "_render_extends": runtime.render_extends,
+            "_render_include": runtime.render_include,
         }
         self._ids = itertools.count()
+        self.block_defs = []  # (function name, body) per compiled block
+        self.block_attach = []  # (BlockNode, function name) to bind after exec
+        self._blocks_seen = set()
 
     def uid(self):
         return next(self._ids)
@@ -359,7 +409,10 @@ class _Codegen:
         return "".join(blocks) or "pass\n"
 
     def visit(self, node):
-        return self._handlers[type(node)](self, node)
+        handler = self._handlers.get(type(node))
+        if handler is None:  # reachable via best-effort block bodies
+            raise _Uncompilable(type(node).__name__)
+        return handler(self, node)
 
     # --- leaves ---------------------------------------------------------
 
@@ -583,6 +636,45 @@ class _Codegen:
             loop=_indented(loop, 2),
         )
 
+    # --- inheritance and inclusion ----------------------------------------
+
+    def visit_block(self, node):
+        i = self.uid()
+        self.namespace[f"_node_{i}"] = node
+        self._compile_block_body(node)
+        return f"_append(_render_block(_node_{i}, context))\n"
+
+    def visit_extends(self, node):
+        # The extends machinery (parent resolution, BlockContext population)
+        # runs through the runtime mirror; this template's blocks compile to
+        # functions the parent's block sites will pick up from BlockContext.
+        i = self.uid()
+        self.namespace[f"_node_{i}"] = node
+        for block in node.blocks.values():
+            self._compile_block_body(block)
+        return f"_append(_render_extends(_node_{i}, context))\n"
+
+    def visit_include(self, node):
+        i = self.uid()
+        self.namespace[f"_node_{i}"] = node
+        return f"_append(_render_include(_node_{i}, context))\n"
+
+    def _compile_block_body(self, node):
+        """Best-effort: a block whose body we can't compile still works —
+        render_block falls back to its nodelist. node.blocks of an
+        ExtendsNode includes nested blocks, and visiting an outer body
+        compiles inner ones, hence the seen-guard."""
+        if id(node) in self._blocks_seen:
+            return
+        self._blocks_seen.add(id(node))
+        try:
+            body = self.nodelist_block(node.nodelist)
+        except _Uncompilable:
+            return
+        name = f"_dtc_block_{self.uid()}"
+        self.block_defs.append((name, body))
+        self.block_attach.append((node, name))
+
     _handlers = {
         TextNode: visit_text,
         VerbatimNode: visit_verbatim,
@@ -593,4 +685,7 @@ class _Codegen:
         WithNode: visit_with,
         AutoEscapeControlNode: visit_autoescape,
         ForNode: visit_for,
+        BlockNode: visit_block,
+        ExtendsNode: visit_extends,
+        IncludeNode: visit_include,
     }

@@ -9,6 +9,7 @@ compare Django with Django.
 import datetime
 
 import pytest
+from django.template import TemplateDoesNotExist
 from django.template.backends.django import DjangoTemplates
 from django.test import RequestFactory
 from django.utils.safestring import mark_safe
@@ -305,6 +306,159 @@ def test_render_reusable():
     assert template._compiled is not None
     assert template.render({"name": "a"}) == "a"
     assert template.render({"name": "b"}) == "b"
+
+
+# --- inheritance and inclusion (phase 4) --------------------------------------
+
+
+def render_named_both(templates, name, context=None, **options):
+    """Render template *name* from a locmem set through both backends."""
+    options.setdefault("builtins", ["support"])
+    options["loaders"] = [("django.template.loaders.locmem.Loader", dict(templates))]
+    context = base_context() if context is None else context
+    dtc_template = make_backend(DTCTemplates, **options).get_template(name)
+    django_out = (
+        make_backend(DjangoTemplates, **options).get_template(name).render(dict(context))
+    )
+    dtc_out = dtc_template.render(dict(context))
+    assert dtc_out == django_out
+    return dtc_template, dtc_out
+
+
+INHERITANCE_TEMPLATES = {
+    "base.html": (
+        "<title>{% block title %}Default{% endblock %}</title>"
+        "<body>{% block content %}base:{{ name }}{% endblock %}</body>"
+    ),
+    "mid.html": (
+        "{% extends 'base.html' %}"
+        "{% block title %}Mid|{{ block.super }}{% endblock %}"
+    ),
+    "leaf.html": (
+        "{% extends 'mid.html' %}"
+        "{% block title %}Leaf|{{ block.super }}{% endblock %}"
+        "{% block content %}leaf:{{ html }}{% endblock %}"
+    ),
+    "leaf_var.html": (
+        "{% extends parent %}{% block content %}var-extends{% endblock %}"
+    ),
+    "base_loop.html": (
+        "{% for x in items %}{% block row %}[{{ x }}]{% endblock %}{% endfor %}"
+    ),
+    "child_forloop.html": (
+        "{% extends 'base_loop.html' %}"
+        "{% block row %}<{{ forloop.counter }}:{{ x }}>{% endblock %}"
+    ),
+    "base_now.html": (
+        "{% now 'Y' %}{% block content %}base{% endblock %}"
+    ),
+    "child_of_now.html": (
+        "{% extends 'base_now.html' %}"
+        "{% block content %}compiled child of interpreted parent{% endblock %}"
+    ),
+    "child_now.html": (
+        "{% extends 'base.html' %}"
+        "{% block content %}{% now 'Y' %} interpreted body{% endblock %}"
+    ),
+    "nested_blocks.html": (
+        "{% block outer %}o[{% block inner %}i:{{ name }}{% endblock %}]o{% endblock %}"
+    ),
+    "override_inner.html": (
+        "{% extends 'nested_blocks.html' %}"
+        "{% block inner %}override{% endblock %}"
+    ),
+    "inc.html": "inc:{{ name }}/{{ extra }};",
+    "inc_forloop.html": "({{ forloop.counter }}:{{ x }})",
+    "main_inc.html": "{% include 'inc.html' %}",
+    "main_inc_with.html": "{% include 'inc.html' with extra='E<' %}",
+    "main_inc_only.html": "{% include 'inc.html' with extra=name only %}",
+    "main_inc_var.html": "{% include which %}",
+    "main_inc_loop.html": "{% for x in items %}{% include 'inc_forloop.html' %}{% endfor %}",
+}
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "base.html",
+        "mid.html",
+        "leaf.html",
+        "base_loop.html",
+        "child_forloop.html",
+        "child_of_now.html",
+        "child_now.html",
+        "nested_blocks.html",
+        "override_inner.html",
+        "main_inc.html",
+        "main_inc_with.html",
+        "main_inc_only.html",
+        "main_inc_loop.html",
+    ],
+)
+def test_differential_inheritance(name):
+    template, _ = render_named_both(INHERITANCE_TEMPLATES, name)
+    assert template._compiled is not None
+
+
+def test_differential_extends_variable():
+    context = dict(base_context(), parent="base.html")
+    template, out = render_named_both(
+        INHERITANCE_TEMPLATES, "leaf_var.html", context
+    )
+    assert template._compiled is not None
+    assert "var-extends" in out
+
+
+def test_differential_include_variable():
+    context = dict(base_context(), which="inc.html")
+    render_named_both(INHERITANCE_TEMPLATES, "main_inc_var.html", context)
+
+
+def test_include_missing_template():
+    for backend_cls in (DTCTemplates, DjangoTemplates):
+        backend = make_backend(
+            backend_cls,
+            loaders=[
+                ("django.template.loaders.locmem.Loader", INHERITANCE_TEMPLATES)
+            ],
+        )
+        template = backend.from_string("{% include 'no-such.html' %}")
+        with pytest.raises(TemplateDoesNotExist):
+            template.render(base_context())
+
+
+def test_forloop_forced_by_block_in_loop():
+    """base_loop's own body never references forloop, but a child override
+    can — a block inside a loop must force forloop maintenance."""
+    options = {
+        "loaders": [("django.template.loaders.locmem.Loader", INHERITANCE_TEMPLATES)]
+    }
+    template = make_backend(DTCTemplates, **options).get_template("base_loop.html")
+    assert "'parentloop'" in template._compiled.__dtc_source__
+
+
+def test_source_cache_reuses_compiled_fn():
+    """Without a cached loader every get_template returns a fresh Template
+    instance; the source cache must prevent recompiling each one."""
+    options = {
+        "loaders": [("django.template.loaders.locmem.Loader", INHERITANCE_TEMPLATES)]
+    }
+    backend = make_backend(DTCTemplates, **options)
+    first = backend.get_template("leaf.html")
+    second = backend.get_template("leaf.html")
+    assert first.template is not second.template  # uncached loader: new parse
+    assert first._compiled is second._compiled  # same compiled function
+    assert second.render(base_context()) == first.render(base_context())
+
+
+def test_block_bodies_attached():
+    options = {
+        "loaders": [("django.template.loaders.locmem.Loader", INHERITANCE_TEMPLATES)]
+    }
+    template = make_backend(DTCTemplates, **options).get_template("leaf.html")
+    extends_node = template.template.nodelist[0]
+    for block in extends_node.blocks.values():
+        assert callable(block.__dict__.get("_dtc_body"))
 
 
 # --- compiled/fallback classification ----------------------------------------

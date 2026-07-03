@@ -127,6 +127,23 @@ rendering is localization-bound in both engines (phase 8 target).
 - Mixed chains must work: a compiled child extending an interpreted parent
   and vice versa. This is what makes per-template fallback composable.
 
+Status: **complete.** Block bodies compile to standalone functions attached
+to the original BlockNodes as `_dtc_body`; Django's own `BlockContext` is
+the chain representation, so mixed compiled/interpreted chains work in both
+directions (interpreted `BlockNode.render` simply ignores the attribute).
+`src/dtc/runtime.py` mirrors `BlockNode`/`ExtendsNode`/`IncludeNode.render`
+(bodies verified identical across 4.2–5.2; the oracle suites police drift)
+with the template-render call swapped for a compiled-aware one — so chains
+compile on demand in plain backend mode, no autopatch needed. `{{
+block.super }}` works through Django's machinery via the existing
+callable-bail in variable lookups. A source-keyed compile cache (per
+engine, name+source) prevents recompile-per-render under non-cached
+loaders — first bench of this scenario was 3x *slower* than stock, now
+fixed and covered by tests. Both suites pass; compiled coverage in Django's
+suite grew to ~1300 templates. Measured: include-heavy inheritance ~1.15x
+(bounded by Django's per-include protocol, which we reproduce — literal
+include inlining is a phase 8 candidate).
+
 ## Phase 5 — The bridge: per-node fallback
 
 Replace whole-template fallback with per-node fallback: an unknown `Node`
