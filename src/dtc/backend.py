@@ -57,9 +57,22 @@ class Template(DjangoTemplateProxy):
         self._compiled = compile_template(template)
 
     def render(self, context=None, request=None):
-        if self._compiled is None:
+        compiled = self._compiled
+        if compiled is None:
             return super().render(context=context, request=request)
         context = make_context(
             context, request, autoescape=self.backend.engine.autoescape
         )
-        return self._compiled(context)
+        # Reproduce django.template.base.Template.render exactly: the
+        # compiled function replaces _render, but the render_context state
+        # push and template binding (which runs context processors on
+        # RequestContext and exposes context.template.engine to nodes) are
+        # still Django's observable semantics.
+        template = self.template
+        with context.render_context.push_state(template):
+            if context.template is None:
+                with context.bind_template(template):
+                    context.template_name = template.name
+                    return compiled(context)
+            else:
+                return compiled(context)

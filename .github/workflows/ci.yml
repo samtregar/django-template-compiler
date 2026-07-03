@@ -25,6 +25,30 @@ jobs:
       - name: Test
         run: pytest -q
 
+  # Compatibility oracle: Django's own template_tests suite, run with dtc's
+  # compiled render path patched in (scripts/run_django_suite.py).
+  django-suite:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        django-version: ["4.2", "5.1", "5.2"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          pip install "django~=${{ matrix.django-version }}.0"
+          pip install -e .
+      - name: Clone Django source at installed version
+        run: |
+          VERSION=$(python -c "import django; print(django.__version__)")
+          git clone --depth 1 --branch "$VERSION" https://github.com/django/django.git /tmp/django-src
+      - name: Run Django template_tests against dtc
+        run: python scripts/run_django_suite.py /tmp/django-src
+
   build:
     runs-on: ubuntu-latest
     steps:
