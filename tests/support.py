@@ -8,6 +8,8 @@ compiled path — one filter per FilterExpression behavior flag.
 from pathlib import Path
 
 from django import template
+from django.conf import settings
+from django.test import override_settings
 from django.utils.html import conditional_escape
 from django.utils.safestring import mark_safe
 
@@ -118,6 +120,58 @@ class AutoescapeOffNode(template.Node):
 @register.tag
 def aoff(parser, token):
     return AutoescapeOffNode()
+
+
+class ThousandsSetNode(template.Node):
+    """A raw third-party-style node: assigns a live setting mid-render.
+    Direct assignment writes through the LazySettings proxy onto the same
+    holder object the compiled int fast path reads, so the flip must show
+    on the very next ``{{ int }}`` output — as it does in stock. Tests use
+    this inside override_settings() so the mutation lands on a throwaway
+    holder."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def render(self, context):
+        settings.USE_THOUSAND_SEPARATOR = self.value
+        return ""
+
+
+@register.tag
+def set_thousands(parser, token):
+    return ThousandsSetNode(token.split_contents()[1] == "on")
+
+
+class OverrideEnterNode(template.Node):
+    """Enters override_settings(USE_THOUSAND_SEPARATOR=True) and leaves it
+    active across the node boundary. That swaps ``settings._wrapped`` — the
+    one settings mutation the per-render holder can't see through — so this
+    pins the holder re-grab in the bridge resync."""
+
+    def render(self, context):
+        override = override_settings(USE_THOUSAND_SEPARATOR=True)
+        override.enable()
+        context.render_context["_test_override"] = override
+        return ""
+
+
+class OverrideExitNode(template.Node):
+    def render(self, context):
+        override = context.render_context["_test_override"]
+        del context.render_context["_test_override"]
+        override.disable()
+        return ""
+
+
+@register.tag
+def thousands_override_on(parser, token):
+    return OverrideEnterNode()
+
+
+@register.tag
+def thousands_override_off(parser, token):
+    return OverrideExitNode()
 
 
 class ContextPeekNode(template.Node):

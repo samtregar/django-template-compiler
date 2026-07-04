@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import weakref
 
+from django.conf import settings
 from django.template.base import Template, TextNode
+from django.utils.functional import empty
 from django.template.loader_tags import (
     BLOCK_CONTEXT_KEY,
     BlockContext,
@@ -200,6 +202,24 @@ def render_extends(node, context):
 
     with context.render_context.push_state(compiled_parent, isolated_context=False):
         return render_body(compiled_parent, context)
+
+
+def settings_holder():
+    """The concrete ``Settings``/``UserSettingsHolder`` behind the
+    ``django.conf.settings`` proxy. Generated code binds it once per render
+    (and re-grabs it at every foreign-code resync site, alongside the
+    hoisted autoescape local), so the int fast path's per-value
+    ``USE_THOUSAND_SEPARATOR`` read is a plain attribute load instead of a
+    trip through ``LazyObject.__getattribute__``. Reads stay per-value and
+    write-through: ``settings.X = v`` assigns onto this same holder, so
+    mid-render mutations are seen exactly as stock sees them. The one thing
+    a holder can't track is being *replaced* — ``override_settings`` swaps
+    ``settings._wrapped`` — which is why it is bound per render, never per
+    compile, and refreshed after bridges/replays/takes_context calls. If
+    settings aren't configured yet, return the proxy itself: rendering then
+    behaves exactly like stock (only an actual settings read raises)."""
+    wrapped = settings._wrapped
+    return settings if wrapped is empty else wrapped
 
 
 def flatten_tail(context):

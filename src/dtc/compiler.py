@@ -54,11 +54,11 @@ Exactness strategy, per the roadmap's optimization principle:
 
 from __future__ import annotations
 
+import html
 import itertools
 import logging
 import os
 
-from django.conf import settings
 from django.template.base import (
     TextNode,
     Variable,
@@ -168,6 +168,40 @@ def _digit_lookup(current, bit, index):
     return getattr(current, bit)
 
 
+def _fast_str_escape(text, _escape=html.escape, _SafeString=SafeString):
+    """django.utils.html.escape minus its keep_lazy wrapper; only ever
+    called on values already proven exact-type ``str`` (the _OUTPUT fast
+    path), where the wrapper's Promise re-dispatch and the ``str(text)``
+    coercion are no-ops."""
+    return _SafeString(_escape(text))
+
+
+def _pick_str_escape(html_escape):
+    """Choose the escape callable the generated str fast path binds:
+    ``_fast_str_escape`` when Django's ``escape`` is verifiably still the
+    keep_lazy(SafeString) wrapper around ``SafeString(html.escape(str(t)))``
+    it has been since 3.0, else Django's own ``escape`` (correct, just
+    slower). Drift guard: the implementations must agree over every ASCII
+    code point (any change to the escape table shows up) plus non-ASCII
+    samples, return exactly ``SafeString``, and ``escape`` must still carry
+    a ``__wrapped__`` (i.e. remain a plain wrapped function rather than
+    something with new behavior the probe can't see)."""
+    probe = "".join(map(chr, range(128))) + "\xa0\xe9\u2028\u2029\U0001f600"
+    try:
+        expected = html_escape(probe)
+        drifted = (
+            getattr(html_escape, "__wrapped__", None) is None
+            or type(expected) is not SafeString
+            or _fast_str_escape(probe) != expected
+        )
+    except Exception:
+        drifted = True
+    return html_escape if drifted else _fast_str_escape
+
+
+_STR_ESCAPE = _pick_str_escape(escape)
+
+
 def compile_template(template):
     """Compile a ``django.template.base.Template`` to a render callable.
 
@@ -195,6 +229,7 @@ def compile_template(template):
 def _preamble(flat):
     lines = (
         "    _autoescape = context.autoescape\n"
+        "    _settings = _settings_holder()\n"
         "    _context_get = context.__getitem__\n"
         "    _context_set = context.__setitem__\n"
         "    _parts = []\n"
@@ -582,8 +617,12 @@ except Exception as _exc:
 # provably identical types; everything else goes through the real thing.
 # Exact int (bool is a subclass, hence the identity check) localizes to
 # str(value) whenever thousand grouping is off — number_format returns the
-# plain digits, which cannot need escaping. The setting is read per render
-# so override_settings behaves.
+# plain digits, which cannot need escaping. The setting is read per value,
+# like stock, but through _settings — the concrete holder behind the
+# LazySettings proxy, bound per render in the preamble (see
+# runtime.settings_holder): direct settings assignments write through to it
+# instantly, and override_settings (which swaps the holder) is re-grabbed
+# at every foreign-code resync site.
 _OUTPUT = """\
 _value_type = _value.__class__
 if _value_type is str:
@@ -614,12 +653,21 @@ else:
 # of them may set context.autoescape, which stock rendering reads live.
 # Values reached through Variable.resolve in conditions and filter arguments
 # are excluded: Django never passes those callables the context.
-_RESYNC_AUTOESCAPE = "_autoescape = context.autoescape\n"
+# The per-render settings holder is re-grabbed at the same sites: such code
+# may enter/exit override_settings, which swaps settings._wrapped. (Foreign
+# code that swaps the holder from a site with no resync — a filter or a
+# non-takes_context tag doing override_settings().enable() mid-render — is
+# seen at the next resync rather than instantly; direct settings mutations
+# write through to the held object and are always seen instantly.)
+_RESYNC_FOREIGN = (
+    "_autoescape = context.autoescape\n_settings = _settings_holder()\n"
+)
 
 _SLOW_OR_ELSE = """\
 if _value is _SLOW:
     _append(_node_{i}.render(context))
     _autoescape = context.autoescape
+    _settings = _settings_holder()
 else:
 {body}\
 """
@@ -727,7 +775,7 @@ class _Codegen:
         self.namespace = {
             "_LOOKUP_EXC": _LOOKUP_EXC,
             "_SLOW": _SLOW,
-            "_escape": escape,
+            "_escape": _STR_ESCAPE,
             "_render_value": render_value_in_context,
             "_SafeData": SafeData,
             "_SafeString": SafeString,
@@ -746,7 +794,7 @@ class _Codegen:
             "_checked_safe_call": runtime.checked_safe_call,
             "_flatten_tail": runtime.flatten_tail,
             "_conditional_escape": conditional_escape,
-            "_settings": settings,
+            "_settings_holder": runtime.settings_holder,
             "_strip_spaces": strip_spaces_between_tags,
             "_tz_override": dj_timezone.override,
             "_lang_override": translation.override,
@@ -817,11 +865,11 @@ class _Codegen:
                     call = f"_checked_safe_render(_node_{i}, context, _writes_{i})"
                 else:
                     call = f"_checked_safe_render(_node_{i}, context)"
-                return f"_append({call})\n" + resync + _RESYNC_AUTOESCAPE
+                return f"_append({call})\n" + resync + _RESYNC_FOREIGN
             return (
                 f"_append(_node_{i}.render_annotated(context))\n"
                 + resync
-                + _RESYNC_AUTOESCAPE
+                + _RESYNC_FOREIGN
             )
         # Bridged nodes may keep per-node state keyed by their own
         # identity (IfChangedNode, CycleNode, ...). Embedding one makes
@@ -829,7 +877,7 @@ class _Codegen:
         # shared across same-source template instances (see
         # runtime.compiled_for).
         self.uses_bridges = True
-        return f"_append(_node_{i}.render_annotated(context))\n" + _RESYNC_AUTOESCAPE
+        return f"_append(_node_{i}.render_annotated(context))\n" + _RESYNC_FOREIGN
 
     def _bridge_checkable(self, node):
         """Checked emission only when the node's child subtrees are provably
@@ -898,7 +946,7 @@ class _Codegen:
             # translate flag, or odd parses (e.g. constant that resolved
             # to None): the original node.
             self.namespace[f"_node_{i}"] = node
-            return f"_append(_node_{i}.render(context))\n" + _RESYNC_AUTOESCAPE
+            return f"_append(_node_{i}.render(context))\n" + _RESYNC_FOREIGN
 
         if fe.filters:
             filters = "".join(
@@ -1291,7 +1339,7 @@ class _Codegen:
         self._compile_block_body(node)
         # The block site may render an override (or, via block.super, an
         # ancestor body) containing autoescape-mutating foreign code.
-        return f"_append(_render_block(_node_{i}, context))\n" + _RESYNC_AUTOESCAPE
+        return f"_append(_render_block(_node_{i}, context))\n" + _RESYNC_FOREIGN
 
     def visit_extends(self, node):
         # The extends machinery (parent resolution, BlockContext population)
@@ -1328,7 +1376,7 @@ class _Codegen:
         # anything inside it may flip autoescape, and stock's later reads
         # would see that. (Isolated includes mutate a context.new() copy;
         # the resync then re-reads an unchanged value — still exact.)
-        return f"_append(_render_include(_node_{i}, context))\n" + _RESYNC_AUTOESCAPE
+        return f"_append(_render_include(_node_{i}, context))\n" + _RESYNC_FOREIGN
 
     def _literal_include(self, node, i, names):
         # The cache key is per include site per compiled function; stock
@@ -1352,7 +1400,7 @@ class _Codegen:
                 + _indented(_INCLUDE_PUSH_STATE.format(i=i, ctx="context"))
                 + "finally:\n    context.pop()\n"
             )
-        return _INCLUDE_LITERAL.format(i=i, body=_indented(body)) + _RESYNC_AUTOESCAPE
+        return _INCLUDE_LITERAL.format(i=i, body=_indented(body)) + _RESYNC_FOREIGN
 
     def _compile_block_body(self, node):
         """node.blocks of an ExtendsNode includes nested blocks, and
@@ -1429,7 +1477,7 @@ class _Codegen:
         call = self._tag_call(node, i)
         # Stock reads context.autoescape *after* the call; a takes_context
         # function may have flipped it.
-        resync = _RESYNC_AUTOESCAPE if node.takes_context else ""
+        resync = _RESYNC_FOREIGN if node.takes_context else ""
         if node.target_var is not None:
             block = (
                 f"_tag_value = {call}\n"
@@ -1476,7 +1524,7 @@ class _Codegen:
         # context.new() below copies autoescape from the live context after
         # the call, as stock does — but the hoisted local needs a resync
         # when a takes_context function may have flipped it.
-        resync = _RESYNC_AUTOESCAPE if node.takes_context else ""
+        resync = _RESYNC_FOREIGN if node.takes_context else ""
         return (
             f"_incl_dict = {self._tag_call(node, i)}\n"
             + resync

@@ -977,6 +977,137 @@ def test_int_fast_path_respects_thousand_separator():
     assert plain.startswith("1234567")
 
 
+def test_thousand_separator_override_between_renders():
+    """The concrete settings holder is bound per render (never per compile):
+    the same compiled template must see override_settings applied and then
+    removed across successive renders."""
+    from django.test import override_settings
+
+    dtc_template = make_backend(DTCTemplates).from_string("{{ big }}")
+    django_template = make_backend(DjangoTemplates).from_string("{{ big }}")
+    assert dtc_template._compiled is not None
+    context = {"big": 1234567}
+    assert dtc_template.render(dict(context)) == django_template.render(dict(context)) == "1234567"
+    with override_settings(USE_THOUSAND_SEPARATOR=True):
+        grouped = dtc_template.render(dict(context))
+        assert grouped == django_template.render(dict(context))
+        assert grouped != "1234567", "override was not actually observed"
+    assert dtc_template.render(dict(context)) == django_template.render(dict(context)) == "1234567"
+
+
+def test_thousand_separator_assigned_mid_render_by_bridged_tag():
+    """Direct settings assignment from a bridged tag writes through to the
+    holder the int fast path reads: the very next {{ int }} must group,
+    exactly as stock's live per-value read behaves. (This is the test a
+    hoisted per-render *value* would fail — only the holder may be cached.)"""
+    from django.test import override_settings
+
+    source = "{{ big }};{% set_thousands on %}{{ big }}"
+    context = {"big": 1234567}
+    outputs = []
+    for backend in (DTCTemplates, DjangoTemplates):
+        template = make_backend(backend, builtins=["support"]).from_string(source)
+        # each render mutates the setting; give each its own throwaway holder
+        with override_settings(USE_THOUSAND_SEPARATOR=False):
+            outputs.append(template.render(dict(context)))
+        if backend is DTCTemplates:
+            assert template._compiled is not None
+    dtc_out, django_out = outputs
+    assert dtc_out == django_out
+    before, after = dtc_out.split(";")
+    assert before == "1234567" and after != "1234567", (
+        "mid-render setting flip was not observed"
+    )
+
+
+def test_thousand_separator_override_swap_mid_render():
+    """override_settings entered by a bridged tag swaps settings._wrapped —
+    invisible through a held holder, so the bridge resync must re-grab it."""
+    from django.test import override_settings
+
+    source = (
+        "{{ big }};{% thousands_override_on %}{{ big }}"
+        "{% thousands_override_off %};{{ big }}"
+    )
+    context = {"big": 1234567}
+    outputs = []
+    for backend in (DTCTemplates, DjangoTemplates):
+        template = make_backend(backend, builtins=["support"]).from_string(source)
+        with override_settings(USE_THOUSAND_SEPARATOR=False):
+            outputs.append(template.render(dict(context)))
+        if backend is DTCTemplates:
+            assert template._compiled is not None
+    dtc_out, django_out = outputs
+    assert dtc_out == django_out
+    first, second, third = dtc_out.split(";")
+    assert first == third == "1234567"
+    assert second != "1234567", "override entered mid-render was not observed"
+
+
+# --- the escape fast path -----------------------------------------------------
+
+EVERY_ASCII = "".join(map(chr, range(1, 128)))
+
+
+def test_escape_fast_path_differential():
+    context = dict(base_context(), everychar=EVERY_ASCII)
+    assert_identical_and_compiled("{{ everychar }}", context)
+    assert_identical_and_compiled(
+        "{% autoescape off %}{{ everychar }}{% endautoescape %}", context
+    )
+    assert_identical_and_compiled("{{ everychar|lower }}", context)
+    # lazy (Promise) values have a non-str class and must keep taking
+    # render_value_in_context, not the inlined escape
+    assert_identical_and_compiled("{{ lazy }}{{ html }}")
+
+
+def test_str_escape_fast_path_selected():
+    """On every supported Django, escape() is keep_lazy(SafeString) around
+    SafeString(html.escape(str(text))), so the drift guard must accept the
+    inlined form. If this fails, Django's escape changed: verify what it
+    does now before re-blessing (the compiled output stays correct either
+    way — the guard falls back to Django's escape)."""
+    from django.utils.html import escape
+
+    from dtc import compiler
+
+    assert compiler._STR_ESCAPE is compiler._fast_str_escape
+    assert compiler._pick_str_escape(escape) is compiler._fast_str_escape
+    probe = EVERY_ASCII + "\xa0\xe9\u2028\U0001f600"
+    assert compiler._fast_str_escape(probe) == escape(probe)
+    assert type(compiler._fast_str_escape(probe)) is type(escape(probe))
+
+
+def test_str_escape_drift_guard_falls_back():
+    """Any observable deviation in escape() — different table, different
+    return type, missing keep_lazy wrapper, or a raising probe — must make
+    the guard bind Django's own escape instead of the inlined form."""
+    import html as html_stdlib
+
+    from django.utils.functional import keep_lazy
+    from django.utils.safestring import SafeString
+
+    from dtc import compiler
+
+    @keep_lazy(SafeString)
+    def drifted_table(text):
+        return SafeString(html_stdlib.escape(str(text)).replace("`", "&#96;"))
+
+    @keep_lazy(str)
+    def drifted_type(text):
+        return html_stdlib.escape(str(text))
+
+    def unwrapped(text):
+        return SafeString(html_stdlib.escape(str(text)))
+
+    @keep_lazy(SafeString)
+    def broken(text):
+        raise RuntimeError("boom")
+
+    for candidate in (drifted_table, drifted_type, unwrapped, broken):
+        assert compiler._pick_str_escape(candidate) is candidate
+
+
 FLAT_MANY = (
     "{{ name }}{{ html }}{{ safe }}{{ n }}{{ f }}{{ missing }}{{ fn }}"
     "{{ obj.name }}{{ d.key }}{{ none }}"
