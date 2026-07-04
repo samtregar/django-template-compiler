@@ -38,6 +38,8 @@ stats = {
     "templates_error": 0,
     "renders_compiled": 0,
     "renders_fallback": 0,
+    "disk_hits": 0,
+    "disk_misses": 0,
 }
 
 # Template._render as shipped by Django, captured before anything patches

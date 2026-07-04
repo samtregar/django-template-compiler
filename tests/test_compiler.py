@@ -308,6 +308,11 @@ CASES = [
     "{{ pairs.0.1 }} {{ pairs.1.0 }} {{ items.2 }}",
     "{{ digitmap.0 }} {{ digitmap.1 }}",
     "[{{ pairs.9 }}] [{{ digitmap.7 }}]",
+    # phase 8 scope locals: rebinding through non-opaque and opaque tags
+    "{% for x in items %}{% stamp 'p' as x %}{{ x }}|{% endfor %}",  # known rebind
+    "{% for x in items %}{% poke x %}{{ x }}|{% endfor %}",  # opaque rebind: no locals
+    "{% for x in items %}{% with x=name %}{{ x }}{% endwith %}[{{ x }}]{% endfor %}",
+    "{% with n=f %}{% for n in items %}{{ n }}{% endfor %}{{ n }}{% endwith %}",
 ]
 
 
@@ -556,6 +561,45 @@ def test_block_bodies_attached():
         assert callable(block.__dict__.get("_dtc_body"))
 
 
+# --- disk cache ----------------------------------------------------------------
+
+
+def test_disk_cache_roundtrip(tmp_path):
+    from dtc.runtime import stats
+
+    options = {"dtc_disk_cache": str(tmp_path)}
+    source = "cache:{{ name }}{% for x in items %}{{ x }}{% endfor %}" + FLAT_MANY
+
+    first = make_backend(DTCTemplates, **options).from_string(source)
+    assert first._compiled is not None
+    expected = first.render(base_context())
+    entries = list(tmp_path.glob("*/*.marshal"))
+    assert entries, "compile should have written a cache entry"
+
+    hits = stats["disk_hits"]
+    second = make_backend(DTCTemplates, **options).from_string(source)
+    assert stats["disk_hits"] == hits + 1  # compile() skipped
+    assert second.render(base_context()) == expected
+
+
+def test_disk_cache_corruption_fails_open(tmp_path):
+    options = {"dtc_disk_cache": str(tmp_path)}
+    source = "corrupt:{{ name }}" + FLAT_MANY
+    make_backend(DTCTemplates, **options).from_string(source)
+    for entry in tmp_path.glob("*/*.marshal"):
+        entry.write_bytes(b"not marshal data")
+    template = make_backend(DTCTemplates, **options).from_string(source)
+    assert template._compiled is not None
+    assert template.render(base_context())  # recompiled fresh
+
+
+def test_disk_cache_distinct_sources(tmp_path):
+    options = {"dtc_disk_cache": str(tmp_path)}
+    make_backend(DTCTemplates, **options).from_string("a:{{ name }}" + FLAT_MANY)
+    make_backend(DTCTemplates, **options).from_string("b:{{ name }}" + FLAT_MANY)
+    assert len(list(tmp_path.glob("*/*.marshal"))) == 2
+
+
 # --- tooling compatibility (phase 7) ------------------------------------------
 
 
@@ -712,6 +756,84 @@ def test_ifchanged_template_not_shareable():
         "{% ifchanged name %}x{% endifchanged %}"
     )
     assert not template._compiled.__dtc_shareable__
+
+
+def test_scope_locals_emitted():
+    template = make_backend(DTCTemplates).from_string(
+        "{% for x in items %}{{ x }}{{ forloop.counter }}{% endfor %}"
+    )
+    source = template._compiled.__dtc_source__
+    assert "_lv0_x = _item_0" in source  # loop var bound to a local
+    assert "_value = _lv0_x" in source  # read through the local
+    assert "_value = _forloop_0" in source  # forloop read through the local
+
+
+def test_scope_locals_disabled_by_opaque_bridge():
+    """{% poke x %} is an unknown tag that rebinds x: the loop must not
+    bind x to a local, or reads after the poke would go stale."""
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% for x in items %}{% poke x %}{{ x }}{% endfor %}"
+    )
+    source = template._compiled.__dtc_source__
+    assert "_lv0_x" not in source
+    assert template.render(base_context()) == "<poke>poked" * 3
+
+
+def test_int_fast_path_respects_thousand_separator():
+    from django.test import override_settings
+
+    source = "{{ big }} {% for x in items %}{{ forloop.counter }}{% endfor %}"
+    context = dict(base_context(), big=1234567)
+    _, plain, _ = render_both(source, context)
+    with override_settings(USE_THOUSAND_SEPARATOR=True):
+        template, grouped, expected = render_both(source, context)
+        assert grouped == expected  # differential under grouping
+    assert plain.startswith("1234567")
+
+
+FLAT_MANY = (
+    "{{ name }}{{ html }}{{ safe }}{{ n }}{{ f }}{{ missing }}{{ fn }}"
+    "{{ obj.name }}{{ d.key }}{{ none }}"
+)
+
+
+def test_flat_snapshot_differential():
+    """Templates over the score threshold read through the flat snapshot;
+    misses, callables, and dotted tails must stay exact."""
+    assert_identical_and_compiled(FLAT_MANY)
+    assert_identical_and_compiled(FLAT_MANY, autoescape=False)
+    assert_identical_and_compiled(
+        "{% for x in items %}{{ name }}:{{ x }} {% endfor %}" + FLAT_MANY
+    )
+    # a written name read both before and after its write goes via the walk
+    assert_identical_and_compiled(
+        "[{{ y }}]{% stamp 'v' as y %}[{{ y }}]" + FLAT_MANY
+    )
+
+
+def test_flat_snapshot_emitted_and_gated():
+    source_of = lambda t: t._compiled.__dtc_source__
+    big = make_backend(DTCTemplates).from_string(FLAT_MANY)
+    assert "_flat_get = context.flatten().get" in source_of(big)
+    assert "_flat_get('name'" in source_of(big)
+
+    small = make_backend(DTCTemplates).from_string("{{ name }}")
+    assert "_flat_get" not in source_of(small)  # below threshold
+
+    written = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% stamp 'v' as y %}" + "{{ y }}" * 8
+    )
+    assert "_flat_get('y'" not in source_of(written)  # written name: walks
+
+    opaque = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% poke z %}" + FLAT_MANY
+    )
+    assert "_flat_get" not in source_of(opaque)  # opaque write: no snapshot
+
+    takes_ctx = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% ctx_reader 'name' %}" + FLAT_MANY
+    )
+    assert "_flat_get" not in source_of(takes_ctx)  # takes_context: no snapshot
 
 
 def test_unknown_tags_bridge():

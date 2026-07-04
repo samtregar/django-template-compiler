@@ -58,6 +58,7 @@ import itertools
 import logging
 import os
 
+from django.conf import settings
 from django.template.base import (
     TextNode,
     Variable,
@@ -90,7 +91,7 @@ from django.utils.html import conditional_escape, escape, strip_spaces_between_t
 from django.utils.safestring import SafeData, SafeString, mark_safe
 from django.utils.timezone import template_localtime
 
-from . import runtime
+from . import diskcache, runtime
 
 logger = logging.getLogger("dtc")
 
@@ -175,13 +176,106 @@ def compile_template(template):
         return None
 
 
-_PREAMBLE = (
-    "    _autoescape = context.autoescape\n"
-    "    _context_get = context.__getitem__\n"
-    "    _context_set = context.__setitem__\n"
-    "    _parts = []\n"
-    "    _append = _parts.append\n"
-)
+def _preamble(flat):
+    lines = (
+        "    _autoescape = context.autoescape\n"
+        "    _context_get = context.__getitem__\n"
+        "    _context_set = context.__setitem__\n"
+        "    _parts = []\n"
+        "    _append = _parts.append\n"
+    )
+    if flat:
+        # Immutable read snapshot for names this unit never writes; same
+        # layer precedence as the context walk. Taken per function
+        # invocation, so block bodies see the caller's live scopes.
+        lines += "    _flat_get = context.flatten().get\n"
+    return lines
+
+
+# Names a unit's own code writes into the context. Reads of these must use
+# the context walk (or a scope local); reads of anything else may use the
+# flattened snapshot — nothing in a flatten-safe template can change them.
+def _collect_writes(nodelist, out):
+    for node in nodelist:
+        node_type = type(node)
+        if node_type is ForNode:
+            out.update(node.loopvars)
+            out.add("forloop")
+            _collect_writes(node.nodelist_loop, out)
+            _collect_writes(node.nodelist_empty, out)
+        elif node_type is WithNode:
+            out.update(node.extra_context)
+            _collect_writes(node.nodelist, out)
+        elif node_type is SimpleNode:
+            if node.target_var is not None:
+                out.add(node.target_var)
+        elif node_type is FilterNode:
+            out.add("var")
+            _collect_writes(node.nodelist, out)
+        elif node_type is IfNode:
+            for _condition, branch in node.conditions_nodelists:
+                _collect_writes(branch, out)
+        elif node_type is IfChangedNode:
+            _collect_writes(node.nodelist_true, out)
+            _collect_writes(node.nodelist_false, out)
+        elif node_type in (
+            AutoEscapeControlNode,
+            SpacelessNode,
+            LocalizeNode,
+            LocalTimeNode,
+            TimezoneNode,
+            LanguageNode,
+        ):
+            _collect_writes(node.nodelist, out)
+        # BlockNode bodies are separate units; block/include/extends
+        # machinery only touches scopes it pushes and pops (net zero).
+
+
+def _score_reads(nodelist, written, depth=0):
+    """Weighted count of read sites that would use the flat snapshot;
+    loop bodies multiply, since they execute per iteration."""
+    weight = 8 ** min(depth, 2)
+    score = 0
+    for node in nodelist:
+        node_type = type(node)
+        if node_type is VariableNode:
+            var = node.filter_expression.var
+            if isinstance(var, Variable) and var.lookups:
+                if var.lookups[0] not in written:
+                    score += weight
+        elif node_type is IfNode:
+            for condition, branch in node.conditions_nodelists:
+                if type(condition) is TemplateLiteral:
+                    fe = condition.value
+                    if (
+                        isinstance(fe.var, Variable)
+                        and fe.var.lookups
+                        and fe.var.lookups[0] not in written
+                    ):
+                        score += weight
+                score += _score_reads(branch, written, depth)
+        elif node_type is ForNode:
+            score += _score_reads(node.nodelist_loop, written, depth + 1)
+            score += _score_reads(node.nodelist_empty, written, depth)
+        elif node_type is WithNode:
+            score += _score_reads(node.nodelist, written, depth)
+        elif node_type is IfChangedNode:
+            score += _score_reads(node.nodelist_true, written, depth)
+            score += _score_reads(node.nodelist_false, written, depth)
+        elif node_type in (
+            AutoEscapeControlNode,
+            SpacelessNode,
+            FilterNode,
+            LocalizeNode,
+            LocalTimeNode,
+            TimezoneNode,
+            LanguageNode,
+        ):
+            score += _score_reads(node.nodelist, written, depth)
+    return score
+
+
+_FLATTEN_THRESHOLD = 6
 
 
 def _compile(template):
@@ -189,23 +283,31 @@ def _compile(template):
     analysis.walk(template.nodelist)  # raises _Uncompilable
 
     codegen = _Codegen(
-        forloop_needed="forloop" in analysis.first_bits or analysis.force_forloop
+        forloop_needed="forloop" in analysis.first_bits or analysis.force_forloop,
+        flatten_safe=not analysis.mutation_opaque,
     )
+    codegen.begin_unit(template.nodelist)
     body = codegen.nodelist_block(template.nodelist)
+    main_flat = codegen.unit_flat
     # Block bodies compile to standalone functions (they're invoked through
     # BlockContext, possibly by a different template in the chain).
     source = "".join(
-        f"def {name}(context):\n{_PREAMBLE}{_indented(block_body)}"
+        f"def {name}(context):\n{_preamble(flat)}{_indented(block_body)}"
         "    return _mark_safe(''.join(_parts))\n"
-        for name, block_body in codegen.block_defs
+        for name, block_body, flat in codegen.block_defs
     )
     source += (
         "def _dtc_render(context):\n"
-        + _PREAMBLE
+        + _preamble(main_flat)
         + _indented(body)
         + "    return _mark_safe(''.join(_parts))\n"
     )
-    code = compile(source, f"<dtc:{template.name or 'unnamed'}>", "exec")
+    cache_dir = diskcache.directory_for(template)
+    code = diskcache.load(cache_dir, source) if cache_dir else None
+    if code is None:
+        code = compile(source, f"<dtc:{template.name or 'unnamed'}>", "exec")
+        if cache_dir:
+            diskcache.store(cache_dir, source, code)
     exec(code, codegen.namespace)
     for node, name in codegen.block_attach:
         node._dtc_body = codegen.namespace[name]
@@ -230,6 +332,11 @@ class _Analysis:
     def __init__(self):
         self.first_bits = set()
         self.force_forloop = False
+        # True when something in the template can write context names we
+        # can't see statically: an opaque bridged tag, or a takes_context
+        # function (it receives the live context). Disables the flattened
+        # read snapshot.
+        self.mutation_opaque = False
 
     def walk(self, nodelist, in_loop=False):
         for node in nodelist:
@@ -289,11 +396,14 @@ class _Analysis:
                 # itself can't see forloop.)
                 for fe in list(node.args) + list(node.kwargs.values()):
                     self._fe(fe)
-                if node_type is SimpleNode and node.takes_context and in_loop:
-                    self.force_forloop = True
+                if node.takes_context:
+                    self.mutation_opaque = True
+                    if node_type is SimpleNode and in_loop:
+                        self.force_forloop = True
             else:
                 # Unknown node: bridged at codegen. Its render can read
-                # anything from the live context.
+                # (or write) anything on the live context.
+                self.mutation_opaque = True
                 if in_loop:
                     self.force_forloop = True
 
@@ -362,14 +472,20 @@ except Exception as _exc:
         raise
 """
 
-# Inlines render_value_in_context for the two overwhelmingly common, provably
-# identical types; everything else goes through the real thing.
+# Inlines render_value_in_context for the three overwhelmingly common,
+# provably identical types; everything else goes through the real thing.
+# Exact int (bool is a subclass, hence the identity check) localizes to
+# str(value) whenever thousand grouping is off — number_format returns the
+# plain digits, which cannot need escaping. The setting is read per render
+# so override_settings behaves.
 _OUTPUT = """\
 _value_type = _value.__class__
 if _value_type is str:
     _append(_escape(_value) if _autoescape else _value)
 elif _value_type is _SafeString:
     _append(_value)
+elif _value_type is int and not _settings.USE_THOUSAND_SEPARATOR:
+    _append(str(_value))
 else:
     _append(_render_value(_value, context))
 """
@@ -452,8 +568,11 @@ def _indented(block, depth=1):
 class _Codegen:
     """Emit the render-function body, one block string per node."""
 
-    def __init__(self, forloop_needed):
+    def __init__(self, forloop_needed, flatten_safe=False):
         self.forloop_needed = forloop_needed
+        self.flatten_safe = flatten_safe
+        self.unit_flat = False
+        self.written = frozenset()
         self.namespace = {
             "_LOOKUP_EXC": _LOOKUP_EXC,
             "_SLOW": _SLOW,
@@ -471,6 +590,7 @@ class _Codegen:
             "_render_include": runtime.render_include,
             "_template_render": runtime.template_render,
             "_conditional_escape": conditional_escape,
+            "_settings": settings,
             "_strip_spaces": strip_spaces_between_tags,
             "_tz_override": dj_timezone.override,
             "_lang_override": translation.override,
@@ -480,9 +600,27 @@ class _Codegen:
         self.block_attach = []  # (BlockNode, function name) to bind after exec
         self._blocks_seen = set()
         self.uses_bridges = False
+        # Compile-time scope map: template name -> generated local variable.
+        # Loop vars, unpacked vars, {% with %} bindings, and the forloop
+        # dict are bound to Python locals (while the context is still
+        # updated in parallel, keeping bridges/filter args/replays exact),
+        # so reads inside the scope skip the context-stack walk entirely.
+        self.scope = {}
+        self._opaque_cache = {}
 
     def uid(self):
         return next(self._ids)
+
+    def begin_unit(self, nodelist):
+        """Per generated function (main body, each block body): collect the
+        unit's written names and decide whether it earns a flat snapshot."""
+        written = set()
+        _collect_writes(nodelist, written)
+        self.written = written
+        self.unit_flat = (
+            self.flatten_safe
+            and _score_reads(nodelist, written) >= _FLATTEN_THRESHOLD
+        )
 
     def nodelist_block(self, nodelist):
         blocks = [self.visit(node) for node in nodelist]
@@ -577,15 +715,69 @@ class _Codegen:
             return setup + _SLOW_OR_ELSE.format(i=i, body=_indented(body))
         return setup + body
 
+    def _scope_safe(self, nodelist):
+        """A scope may bind names to locals only if its body contains no
+        opaque bridged node: an unknown tag can rebind any context name
+        behind our back ({% regroup ... as x %}), and a stale local would
+        diverge. All dedicated-codegen nodes either don't write the outer
+        scope or (simple_tag target_var) are handled explicitly."""
+        return not self._has_opaque(nodelist)
+
+    def _has_opaque(self, nodelist):
+        cached = self._opaque_cache.get(id(nodelist))
+        if cached is not None:
+            return cached
+        result = False
+        for node in nodelist:
+            if type(node) not in self._handlers:
+                result = True
+                break
+            for attr in getattr(node, "child_nodelists", ()):
+                child = getattr(node, attr, None)
+                if child is not None and self._has_opaque(child):
+                    result = True
+                    break
+            if result:
+                break
+        self._opaque_cache[id(nodelist)] = result
+        return result
+
+    def _bind_local(self, name, i):
+        """Register a scope local for *name* if it forms a valid
+        identifier; returns the local's name or None."""
+        local = f"_lv{i}_{name}"
+        if not local.isidentifier():
+            return None
+        self.scope[name] = local
+        return local
+
     def _lookup_stanzas(self, lookups):
         first, *rest = lookups
-        block = _LOOKUP_FIRST.format(bit=first)
+        steps = ""
         for bit in rest:
             if bit.isdigit():
-                block += _LOOKUP_STEP_DIGIT.format(bit=bit, index=int(bit))
+                steps += _LOOKUP_STEP_DIGIT.format(bit=bit, index=int(bit))
             else:
-                block += _LOOKUP_STEP.format(bit=bit)
-        return block + _LOOKUP_EXCEPT
+                steps += _LOOKUP_STEP.format(bit=bit)
+
+        local = self.scope.get(first)
+        if local is not None:
+            # Scope-bound first bit: a plain local read, nothing to raise.
+            head = f"_value = {local}\nif callable(_value):\n    _value = _SLOW\n"
+        elif self.unit_flat and first not in self.written:
+            # Snapshot read: one dict lookup. A miss lands on the _SLOW
+            # sentinel, which is not callable, so the single check routes
+            # both misses and callables to the slow-path replay (which
+            # applies string_if_invalid / calling semantics exactly).
+            head = (
+                f"_value = _flat_get({first!r}, _SLOW)\n"
+                "if callable(_value):\n    _value = _SLOW\n"
+            )
+        else:
+            return _LOOKUP_FIRST.format(bit=first) + steps + _LOOKUP_EXCEPT
+        if not rest:
+            return head
+        return head + "try:\n" + steps + _LOOKUP_EXCEPT
 
     def _filter_call(self, func, args, i, j):
         """One filter application, mirroring FilterExpression.resolve's
@@ -674,15 +866,25 @@ class _Codegen:
 
     def visit_with(self, node):
         i = self.uid()
+        scoped = self._scope_safe(node.nodelist)
+        saved_scope = dict(self.scope)
+        setup = ""
         items = []
         for k, (key, fe) in enumerate(node.extra_context.items()):
             name = f"_with_{i}_{k}"
             self.namespace[name] = fe
-            items.append(f"{key!r}: {name}.resolve(context)")
-        # Values resolve before the push, as in WithNode.render.
-        block = "context.push({" + ", ".join(items) + "})\n"
+            local = self._bind_local(key, i) if scoped else None
+            if local is not None:
+                # Resolution order is preserved: setup lines run in
+                # extra_context order before the push, as in WithNode.
+                setup += f"{local} = {name}.resolve(context)\n"
+                items.append(f"{key!r}: {local}")
+            else:
+                items.append(f"{key!r}: {name}.resolve(context)")
+        block = setup + "context.push({" + ", ".join(items) + "})\n"
         block += "try:\n" + _indented(self.nodelist_block(node.nodelist))
         block += "finally:\n    context.pop()\n"
+        self.scope = saved_scope
         return block
 
     def visit_autoescape(self, node):
@@ -701,19 +903,36 @@ class _Codegen:
     def visit_for(self, node):
         i = self.uid()
         self.namespace[f"_seq_{i}"] = node.sequence
+        scoped = self._scope_safe(node.nodelist_loop)
+        saved_scope = dict(self.scope)
 
         body = ""
         if self.forloop_needed:
             body += _FORLOOP_UPDATE.format(i=i)
+            if scoped:
+                self.scope["forloop"] = f"_forloop_{i}"
         if len(node.loopvars) == 1:
-            body += f"_context_set({node.loopvars[0]!r}, _item_{i})\n"
+            loopvar = node.loopvars[0]
+            local = self._bind_local(loopvar, i) if scoped else None
+            if local is not None:
+                body += f"{local} = _item_{i}\n"
+                body += f"_context_set({loopvar!r}, {local})\n"
+            else:
+                body += f"_context_set({loopvar!r}, _item_{i})\n"
             body += self.nodelist_block(node.nodelist_loop)
         else:
             # Unpack pushes a scope per iteration; the pop is deliberately
             # not exception-protected, matching ForNode.render.
-            body += f"context.update(_unpack({tuple(node.loopvars)!r}, _item_{i}))\n"
+            body += f"_unpacked_{i} = _unpack({tuple(node.loopvars)!r}, _item_{i})\n"
+            if scoped:
+                for loopvar in node.loopvars:
+                    local = self._bind_local(loopvar, i)
+                    if local is not None:
+                        body += f"{local} = _unpacked_{i}[{loopvar!r}]\n"
+            body += f"context.update(_unpacked_{i})\n"
             body += self.nodelist_block(node.nodelist_loop)
             body += "context.pop()\n"
+        self.scope = saved_scope
 
         loop = ""
         if node.is_reversed:
@@ -872,9 +1091,20 @@ class _Codegen:
         if id(node) in self._blocks_seen:
             return
         self._blocks_seen.add(id(node))
-        body = self.nodelist_block(node.nodelist)
+        # Block bodies become separate functions: enclosing scope locals
+        # don't exist there (their values reach the body via the context),
+        # and they take their own flat snapshot per invocation — which is
+        # what lets an override read the enclosing template's loop scopes.
+        saved = (self.scope, self.written, self.unit_flat)
+        self.scope = {}
+        self.begin_unit(node.nodelist)
+        try:
+            body = self.nodelist_block(node.nodelist)
+            flat = self.unit_flat
+        finally:
+            self.scope, self.written, self.unit_flat = saved
         name = f"_dtc_block_{self.uid()}"
-        self.block_defs.append((name, body))
+        self.block_defs.append((name, body, flat))
         self.block_attach.append((node, name))
 
     # --- custom tag helpers (simple_tag / inclusion_tag) -------------------
@@ -920,7 +1150,15 @@ class _Codegen:
         i = self.uid()
         call = self._tag_call(node, i)
         if node.target_var is not None:
-            return f"context[{node.target_var!r}] = {call}\n"
+            block = (
+                f"_tag_value = {call}\n"
+                f"context[{node.target_var!r}] = _tag_value\n"
+            )
+            local = self.scope.get(node.target_var)
+            if local is not None:
+                # The tag rebinds a scope-local name: keep the local in sync.
+                block += f"{local} = _tag_value\n"
+            return block
         return (
             f"_value = {call}\n"
             "if _autoescape:\n"

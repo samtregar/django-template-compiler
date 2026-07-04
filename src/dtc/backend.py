@@ -39,6 +39,19 @@ class DTCTemplates(DjangoTemplates):
     back to Django's interpreted renderer.
     """
 
+    def __init__(self, params):
+        params = params.copy()
+        options = params.get("OPTIONS", {}).copy()
+        # dtc's own option must not reach Django's Engine (unknown kwargs
+        # raise TypeError there).
+        disk_cache = options.pop("dtc_disk_cache", None)
+        params["OPTIONS"] = options
+        super().__init__(params)
+        if disk_cache:
+            from .diskcache import resolve_dir
+
+            self.engine._dtc_disk_cache = resolve_dir(disk_cache)
+
     def from_string(self, template_code):
         return Template(self.engine.from_string(template_code), self)
 

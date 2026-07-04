@@ -179,6 +179,25 @@ def main():
             f" {django_time / dtc_time:8.2f}x"
         )
 
+    try:
+        import jinja2
+    except ImportError:
+        jinja2 = None
+    if jinja2 is not None:
+        # Reference point, not a target: Jinja2 changes the template
+        # language to get its speed; dtc's constraint is byte-identical
+        # Django output. Same table scenario, hand-translated.
+        env = jinja2.Environment(autoescape=True)
+        jinja_template = env.from_string(
+            "{% for row in table %}<tr {% if loop.first %}class='f'{% endif %}>"
+            "{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>{% endfor %}"
+        )
+        table = {"table": [[f"c{r}.{c}" for c in range(4)] for r in range(50)]}
+        timer = timeit.Timer(lambda: jinja_template.render(**table))
+        number, _ = timer.autorange()
+        jinja_time = min(timer.repeat(repeat=5, number=number)) / number
+        print(f"{'  (jinja2 reference, table scenario)':38} {'':>10} {jinja_time * 1e6:8.1f}us")
+
     name, template_name, context = inheritance_scenario()
     dtc_template = dtc_backend.get_template(template_name)
     django_template = django_backend.get_template(template_name)
@@ -192,5 +211,45 @@ def main():
     )
 
 
+def cold_start_report(count=100):
+    """Per-template cost of getting to a renderable state on process start:
+    Django's parse alone, dtc parse+compile, and dtc with the disk cache."""
+    import shutil
+    import tempfile
+    import time
+
+    source_for = lambda i: (
+        f"<!-- {i} -->{{% for row in table %}}<tr {{% if forloop.first %}}c{{% endif %}}>"
+        "{% for cell in row %}<td>{{ cell|upper }}</td>{% endfor %}</tr>{% endfor %}"
+        "{{ a }}{{ b }}{{ c }}{{ d }}{{ e }}{{ f }}{{ g }}"
+    )
+
+    def measure(make, label):
+        start = time.perf_counter()
+        for i in range(count):
+            make(source_for(i))
+        per = (time.perf_counter() - start) / count
+        print(f"{label:38} {per * 1e6:8.1f}us/template")
+
+    django_backend = make_backend(DjangoTemplates)
+    measure(django_backend.from_string, "cold start: django parse only")
+    measure(make_backend(DTCTemplates).from_string, "cold start: dtc parse+compile")
+
+    cache_dir = tempfile.mkdtemp(prefix="dtc-bench-cache-")
+    try:
+        opts = {
+            "NAME": "bench",
+            "DIRS": [],
+            "APP_DIRS": False,
+            "OPTIONS": {"dtc_disk_cache": cache_dir},
+        }
+        measure(DTCTemplates(dict(opts)).from_string, "cold start: dtc cache cold (writes)")
+        measure(DTCTemplates(dict(opts)).from_string, "cold start: dtc cache warm (hits)")
+    finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     main()
+    print()
+    cold_start_report()

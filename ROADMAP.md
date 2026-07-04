@@ -247,3 +247,39 @@ Status: **complete.**
   starts).
 - Published benchmarks (vs. stock engine; Jinja2 as reference point).
 - Docs, 0.1.0 on PyPI, trial in a real application.
+
+Status: **core optimizations landed.**
+
+- Compile-time scope locals: loop vars, unpacked vars, `{% with %}`
+  bindings, and the forloop dict bind to Python locals (context still
+  updated in parallel, so bridges/filter args/replays stay exact). Static
+  scoping makes this sound; the one hazard — an opaque bridged tag
+  rebinding a name mid-scope ({% regroup ... as x %}) — disables locals for
+  that scope only, decided per scope by analysis. simple_tag `as var`
+  rebinds are known and kept in sync.
+- Exact-int output fast path: `str(value)` unless
+  `settings.USE_THOUSAND_SEPARATOR` (read per render; digits never need
+  escaping). This was the localization overhead flagged in phase 3.
+- Headline: `forloop.counter` loops went 1.17x → **5.4x**; loops overall
+  2.2–2.4x; README has the table. Jinja2 reference measured: dtc closes
+  ~half the gap while staying byte-identical.
+- Context flattening: units over a read-score threshold take an immutable
+  `context.flatten()` snapshot at function entry; reads partition at
+  compile time (scope local / context walk for unit-written names / one
+  `dict.get` against the snapshot, with misses and callables joining the
+  existing slow-path replay). Any opaque bridge or `takes_context` tag in
+  the template disables it; block bodies snapshot per invocation, which is
+  what makes cross-template scope reads correct. var-heavy 1.6x → 1.8x;
+  the remaining per-variable cost is `escape()` itself, which both engines
+  pay — near the semantic floor for flat templates.
+- Disk cache (`src/dtc/diskcache.py`, opt-in via
+  `OPTIONS["dtc_disk_cache"]` or `DTC_DISK_CACHE`): marshaled code objects
+  keyed by SHA-256 of the *generated source* — self-validating, since the
+  source reflects everything behavior-relevant; the namespace is rebuilt
+  from the fresh parse by codegen either way. Cold-start compile overhead
+  measured at ~9x Django's parse per template; warm cache cuts it ~70%
+  (892µs → 271µs/template incl. parse). Fail-open on any read error;
+  directory versioned by Python+dtc version; trusted-directory caveat
+  documented (loaded code is exec'd).
+- Remaining (deliberately deferred): literal-include inlining, real-app
+  trial, 0.1.0 release.
