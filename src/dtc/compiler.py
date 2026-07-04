@@ -40,7 +40,9 @@ Exactness strategy, per the roadmap's optimization principle:
   line by line (including its quirks: the empty branch renders inside the
   pushed scope; the per-iteration unpack pop is not exception-protected).
   Iteration output appends into the top-level parts buffer directly instead
-  of Django's per-loop list-and-join.
+  of Django's per-loop list-and-join. Bare-variable sequences (and
+  ``{% ifchanged %}`` comparands) take the same inline lookup fast path as
+  variable output, bailing to the original FilterExpression on deviation.
 - ``{% if %}`` conditions evaluate through Django's own parsed condition
   objects (whose operator nodes swallow exceptions individually — that
   semantics is theirs to keep); the overwhelmingly common single-variable
@@ -244,6 +246,24 @@ def _preamble(flat):
         # invocation, so block bodies see the caller's live scopes.
         lines += "    _flat_get = _flatten_tail(context).get\n"
     return lines
+
+
+def _plain_variable(fe):
+    """The bare ``Variable`` behind a FilterExpression, or ``None``: no
+    filters, a real lookup path (not a literal), no i18n translation — the
+    shape the inline lookup stanzas can evaluate. Callers pair the stanzas
+    with a ``_SLOW`` tail that replays through the original
+    FilterExpression, so anything the stanzas bail on (misses, callables,
+    unusual types) keeps Django's own semantics."""
+    var = getattr(fe, "var", None)
+    if (
+        not fe.filters
+        and isinstance(var, Variable)
+        and var.lookups is not None
+        and not var.translate
+    ):
+        return var
+    return None
 
 
 def _is_declared_safe(node):
@@ -700,11 +720,13 @@ else:
 
 # ForNode.render, reshaped: the pushed scope is a try/finally (Django's
 # `with context.push()`), the empty branch renders inside it, iteration
-# output appends straight into _parts.
+# output appends straight into _parts. {resolve} is the sequence
+# resolution: FilterExpression.resolve(context, True) verbatim, preceded
+# by the inline lookup stanzas when the sequence is a bare variable.
 _FOR_HEAD = """\
 context.push()
 try:
-    _values_{i} = _seq_{i}.resolve(context, True)
+{resolve}\
     if _values_{i} is None:
         _values_{i} = []
     if not hasattr(_values_{i}, '__len__'):
@@ -1124,14 +1146,8 @@ class _Codegen:
         # through Django's own parsed condition object, which owns the
         # smart-if semantics (operator nodes swallow exceptions to False).
         if type(condition) is TemplateLiteral:
-            fe = condition.value
-            var = fe.var
-            if (
-                not fe.filters
-                and isinstance(var, Variable)
-                and var.lookups is not None
-                and not var.translate
-            ):
+            var = _plain_variable(condition.value)
+            if var is not None:
                 return self._lookup_stanzas(var.lookups) + _CONDITION_FAST_TAIL.format(
                     i=i
                 )
@@ -1176,6 +1192,21 @@ class _Codegen:
     def visit_for(self, node):
         i = self.uid()
         self.namespace[f"_seq_{i}"] = node.sequence
+        # A bare-variable sequence ({% for x in rows %}, and especially
+        # {% for cell in row %} where `row` is an enclosing loop's scope
+        # local) evaluates through the inline lookup stanzas; any bail
+        # replays through FilterExpression.resolve(context, True), which
+        # invokes callables and maps a miss to None (-> empty loop) exactly
+        # as ForNode.render does. Built against the enclosing scope, before
+        # this loop's own bindings exist.
+        var = _plain_variable(node.sequence)
+        if var is not None:
+            resolve = self._lookup_stanzas(var.lookups) + (
+                f"_values_{i} = _seq_{i}.resolve(context, True)"
+                " if _value is _SLOW else _value\n"
+            )
+        else:
+            resolve = f"_values_{i} = _seq_{i}.resolve(context, True)\n"
         scoped = self._scope_safe(node.nodelist_loop)
         saved_scope = dict(self.scope)
 
@@ -1211,8 +1242,15 @@ class _Codegen:
         if node.is_reversed:
             loop += f"_values_{i} = reversed(_values_{i})\n"
         if self.forloop_needed:
+            # An enclosing loop's forloop dict is the same object as
+            # context['forloop'] here (the scope local exists only when
+            # nothing opaque could have rebound it), so the parentloop
+            # grab reads the local; otherwise Django's runtime check.
+            parent = self.scope.get("forloop") or (
+                "context['forloop'] if 'forloop' in context else {}"
+            )
             loop += (
-                f"_parentloop_{i} = context['forloop'] if 'forloop' in context else {{}}\n"
+                f"_parentloop_{i} = {parent}\n"
                 f"_forloop_{i} = context['forloop'] = {{'parentloop': _parentloop_{i}}}\n"
                 f"for _index_{i}, _item_{i} in enumerate(_values_{i}):\n"
             )
@@ -1222,6 +1260,7 @@ class _Codegen:
 
         return _FOR_HEAD.format(
             i=i,
+            resolve=_indented(resolve),
             empty=_indented(self.nodelist_block(node.nodelist_empty), 2),
             loop=_indented(loop, 2),
         )
@@ -1270,21 +1309,37 @@ class _Codegen:
     def visit_ifchanged(self, node):
         """IfChangedNode.render: state lives on the forloop dict inside
         loops (analysis forces the dict on), else on render_context, keyed
-        by the node — which also makes this template non-shareable."""
+        by the node — which also makes this template non-shareable. The
+        frame is the forloop scope local when one is live (same object as
+        context['forloop']). Bare-variable comparands evaluate through the
+        lookup stanzas — notably {% ifchanged p.0 %} on a tuple, where
+        Django's own resolve pays a dir(current) check per miss — with any
+        bail replaying through the original FilterExpression; every
+        comparand lands in an ordered temp so mixed fast/slow lists keep
+        Django's left-to-right evaluation (filters may have side effects)."""
         i = self.uid()
         self.namespace[f"_node_{i}"] = node
         self.uses_bridges = True  # identity-keyed state: per-parse function
+        frame = self.scope.get("forloop") or (
+            "context['forloop'] if 'forloop' in context else context.render_context"
+        )
         block = (
-            f"_ifch_frame_{i} = context['forloop'] if 'forloop' in context"
-            " else context.render_context\n"
+            f"_ifch_frame_{i} = {frame}\n"
             f"_ifch_frame_{i}.setdefault(_node_{i})\n"
         )
         if node._varlist:
             for k, fe in enumerate(node._varlist):
                 self.namespace[f"_ifv_{i}_{k}"] = fe
+                var = _plain_variable(fe)
+                if var is not None:
+                    block += self._lookup_stanzas(var.lookups) + (
+                        f"_ifcv_{i}_{k} = _ifv_{i}_{k}.resolve(context, True)"
+                        " if _value is _SLOW else _value\n"
+                    )
+                else:
+                    block += f"_ifcv_{i}_{k} = _ifv_{i}_{k}.resolve(context, True)\n"
             compare = ", ".join(
-                f"_ifv_{i}_{k}.resolve(context, True)"
-                for k in range(len(node._varlist))
+                f"_ifcv_{i}_{k}" for k in range(len(node._varlist))
             )
             block += (
                 f"_ifch_cmp_{i} = [{compare}]\n"

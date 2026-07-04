@@ -2,7 +2,7 @@
 
 A drop-in replacement for Django's template engine, 100% compatible including custom tags and filters, but much faster.
 
-**Status: pre-alpha, but substantially complete.** Every parseable template compiles: dedicated code generation for the core template language (variables, filters, control flow, inheritance, `simple_tag`/`inclusion_tag`, container tags), with anything else — arbitrary third-party tags included — running as-is against the live context. dtc passes Django's own template test suite (Django 4.2–5.2) in CI, plus a differential fuzzer. Typical speedups: 2.5–4.5x on template-bound rendering, with a ~1.2x floor when a template is dominated by bridged tags. Not yet exercised by production traffic — try it and report.
+**Status: pre-alpha, but substantially complete.** Every parseable template compiles: dedicated code generation for the core template language (variables, filters, control flow, inheritance, `simple_tag`/`inclusion_tag`, container tags), with anything else — arbitrary third-party tags included — running as-is against the live context. dtc passes Django's own template test suite (Django 4.2–5.2) in CI, plus a differential fuzzer. Typical speedups: 2.5–5x on template-bound rendering, with a ~1.2x floor when a template is dominated by bridged tags. Not yet exercised by production traffic — try it and report.
 
 Two behaviors worth knowing:
 
@@ -19,16 +19,16 @@ Templates are parsed with Django's own lexer and parser, then compiled to Python
 
 | scenario | django | dtc | speedup |
 |---|---:|---:|---:|
-| 40 plain variables | 56.7 | 15.4 | 3.7x |
-| 100-row loop | 174.4 | 38.4 | 4.5x |
-| 100-row loop with `forloop.counter` | 717.6 | 110.0 | **6.5x** |
-| 50×4 table (nested loop + if) | 542.8 | 208.5 | 2.6x |
-| with/if scopes | 222.0 | 68.7 | 3.2x |
-| spaceless-wrapped table | 273.0 | 78.5 | 3.5x |
-| inheritance + include in loop | 175.8 | 95.5 | 1.8x |
-| bridged unknown tag (worst case) | 26.5 | 18.0 | 1.5x |
+| 40 plain variables | 53.8 | 15.6 | 3.4x |
+| 100-row loop | 170.3 | 37.6 | 4.5x |
+| 100-row loop with `forloop.counter` | 706.0 | 110.4 | **6.4x** |
+| 50×4 table (nested loop + if) | 543.8 | 156.9 | 3.5x |
+| with/if scopes | 211.7 | 68.8 | 3.1x |
+| spaceless-wrapped table | 269.5 | 66.9 | 4.0x |
+| inheritance + include in loop | 160.2 | 92.8 | 1.7x |
+| bridged unknown tag (worst case) | 26.5 | 17.9 | 1.5x |
 
-For reference, Jinja2 renders the table scenario in ~85µs — dtc closes about three-quarters of the gap to Jinja2 while producing byte-identical Django output. The remaining distance is the price of Django's semantics themselves (silent variable failures, callable auto-invocation, the context stack), which dtc preserves exactly and Jinja2 deliberately dropped.
+For reference, Jinja2 renders the table scenario in ~85µs — dtc closes about 85% of the gap to Jinja2 while producing byte-identical Django output. The remaining distance is the price of Django's semantics themselves (silent variable failures, callable auto-invocation, the context stack), which dtc preserves exactly and Jinja2 deliberately dropped.
 
 ## Installation
 

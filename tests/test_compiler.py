@@ -120,6 +120,7 @@ def base_context():
         "pairs": [("a", 1), ("b", 2)],
         "gen": NoLen(),
         "repeats": ["a", "a", "b", "b", "b", "c"],
+        "grouped": [("t1", "m1"), ("t1", "m2"), ("t2", "m3")],
         "prefix": "<pre>",
         "people": [
             {"name": "ann", "team": "red"},
@@ -313,6 +314,20 @@ CASES = [
     "{% for x in items %}{% poke x %}{{ x }}|{% endfor %}",  # opaque rebind: no locals
     "{% for x in items %}{% with x=name %}{{ x }}{% endwith %}[{{ x }}]{% endfor %}",
     "{% with n=f %}{% for n in items %}{{ n }}{% endfor %}{{ n }}{% endwith %}",
+    # bare-variable {% for %} sequences and {% ifchanged %} comparands take
+    # the inline lookup fast path; deviations replay through the original
+    # FilterExpression (misses -> None, callables invoked)
+    "{% for pair in pairs %}{% for x in pair %}{{ x }},{% endfor %};{% endfor %}",
+    "{% for x in pairs.0 %}[{{ x }}]{% endfor %}",  # digit-bit sequence
+    "{% for k in d.nested.deeper %}{{ k }}{% endfor %}",  # dotted sequence
+    "{% for c in fn %}{{ c }}{% endfor %}",  # callable sequence: replay invokes
+    "{% for c in b %}{{ c }}.{% endfor %}",  # plain-str sequence iterates chars
+    "{% for x in items|slice:':2' %}{{ x }}{% endfor %}",  # filtered: Django resolve
+    "{% with seq=items %}{% for x in seq %}{{ x }}{% endfor %}{% endwith %}",
+    "{% for p in grouped %}{% ifchanged p.0 %}<{{ p.0 }}>{% endifchanged %}{{ p.1 }};{% endfor %}",
+    "{% for p in grouped %}{% ifchanged p.0 p.1|upper %}!{% else %}={% endifchanged %}{% endfor %}",
+    "{% for x in repeats %}{% ifchanged missing %}m{% else %}-{% endifchanged %}{% endfor %}",
+    "{% for x in repeats %}{% ifchanged fn x %}c{% endifchanged %}{% endfor %}",
 ]
 
 
@@ -872,6 +887,36 @@ def test_scope_locals_emitted():
     assert "_lv0_x = _item_0" in source  # loop var bound to a local
     assert "_value = _lv0_x" in source  # read through the local
     assert "_value = _forloop_0" in source  # forloop read through the local
+
+
+def test_sequence_and_ifchanged_fast_paths_emitted():
+    source_of = lambda t: t._compiled.__dtc_source__
+
+    nested = make_backend(DTCTemplates).from_string(
+        "{% for pair in pairs %}{% if forloop.first %}f{% endif %}"
+        "{% for x in pair %}{{ x }}{% endfor %}{% endfor %}"
+    )
+    src = source_of(nested)
+    # the inner sequence reads the enclosing loop's scope local, and every
+    # bare-variable sequence resolve is stanza-guarded
+    assert "_value = _lv0_pair\n" in src
+    assert src.count("if _value is _SLOW else _value") == 2
+    # the inner loop's parentloop grab is the enclosing forloop local, not
+    # a context walk
+    assert "_parentloop_2 = _forloop_0\n" in src
+
+    grouped = make_backend(DTCTemplates).from_string(
+        "{% for p in grouped %}{% ifchanged p.0 %}x{% endifchanged %}{% endfor %}"
+    )
+    src = source_of(grouped)
+    assert "_ifch_frame_1 = _forloop_0\n" in src  # frame via the scope local
+    assert "_digit_lookup(_value, '0', 0)" in src  # comparand skips dir()
+
+    filtered = make_backend(DTCTemplates).from_string(
+        "{% for x in items|slice:':2' %}{{ x }}{% endfor %}"
+    )
+    # a filtered sequence keeps Django's resolve, unguarded
+    assert "_values_0 = _seq_0.resolve(context, True)\n" in source_of(filtered)
 
 
 def test_scope_locals_disabled_by_opaque_bridge():
