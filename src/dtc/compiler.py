@@ -228,7 +228,7 @@ def _declared_writes(node):
     frozenset — or None when the node carries no declaration and must stay
     opaque. ``dtc_context_writes`` (raw nodes only; see
     ``dtc.declare_writes``) names the *instance attributes* holding the
-    written key names, since targets like ``{% store ... as x %}`` are
+    written key names, since targets like ``{% capture x %}`` are
     parse-time data; ``dtc_context_safe`` is the writes-nothing case. The
     writes may set the keys on the effective top of the stack
     (``context[k] = v``) or the root layer (``context.dicts[0][k] = v`` —

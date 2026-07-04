@@ -83,17 +83,17 @@ def declare_writes(node_class, *attr_names):
     The attributes are named (rather than the keys themselves) because
     write targets are parse-time data::
 
-        class StoreNode(Node):
-            def __init__(self, nodelist, save_to):
+        class CaptureNode(Node):
+            def __init__(self, nodelist, target):
                 self.nodelist = nodelist
-                self.save_to = save_to     # {% store as NAME %}
+                self.target = target     # {% capture NAME %}...{% endcapture %}
             def render(self, context):
-                context[self.save_to] = self.nodelist.render(context)
+                context[self.target] = self.nodelist.render(context)
                 return ""
 
-        dtc.declare_writes(StoreNode, "save_to")
+        dtc.declare_writes(CaptureNode, "target")
         # or, on a class you own, equivalently:
-        #     dtc_context_writes = ("save_to",)
+        #     dtc_context_writes = ("target",)
 
     The promise, per ``render()`` call: the only context mutations are
     setting the named keys — on the effective top of the stack

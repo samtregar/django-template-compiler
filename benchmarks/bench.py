@@ -106,7 +106,7 @@ register = _dj_template.Library()
 
 
 class BenchCellNode(_dj_template.Node):
-    """A DivideNode-style third-party tag: reads two values, writes nothing."""
+    """A typical read-only third-party tag: reads two values, writes nothing."""
 
     def __init__(self, var):
         self.var = _dj_template.Variable(var)

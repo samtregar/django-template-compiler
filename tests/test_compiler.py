@@ -1290,26 +1290,26 @@ def test_declared_safe_inherited_by_subclass():
 
 
 def test_declared_writes_differential():
-    assert_identical_and_compiled("{% store as r %}x={{ name }}{% endstore %}{{ r }}")
+    assert_identical_and_compiled("{% capture r %}x={{ name }}{% endcapture %}{{ r }}")
     assert_identical_and_compiled(  # the motivating example: forloop in the body
-        "{% store as csv %}{% for v in items %}{{ v }}"
-        "{% if not forloop.last %},{% endif %}{% endfor %}{% endstore %}[{{ csv }}]"
+        "{% capture csv %}{% for v in items %}{{ v }}"
+        "{% if not forloop.last %},{% endif %}{% endfor %}{% endcapture %}[{{ csv }}]"
     )
-    # store inside a loop writes the loop scope: the value is visible after
-    # the store, gone after the loop pops — stock semantics, preserved.
+    # capture inside a loop writes the loop scope: the value is visible after
+    # the capture, gone after the loop pops — stock semantics, preserved.
     assert_identical_and_compiled(
-        "{% for x in items %}{% store as s %}{{ x }}!{% endstore %}{{ s }};"
+        "{% for x in items %}{% capture s %}{{ x }}!{% endcapture %}{{ s }};"
         "{% endfor %}[{{ s }}]"
     )
     # read before and after the write
     assert_identical_and_compiled(
-        "[{{ r }}]{% store as r %}v{% endstore %}[{{ r }}]" + FLAT_MANY
+        "[{{ r }}]{% capture r %}v{% endcapture %}[{{ r }}]" + FLAT_MANY
     )
 
 
 def test_declared_writes_keeps_flat_snapshot():
     template = make_backend(DTCTemplates, builtins=["support"]).from_string(
-        "{% store as stored %}v{% endstore %}{{ stored }}" + FLAT_MANY
+        "{% capture stored %}v{% endcapture %}{{ stored }}" + FLAT_MANY
     )
     source = template._compiled.__dtc_source__
     assert "_flat_get('name'" in source  # snapshot survives the declared write
@@ -1320,7 +1320,7 @@ def test_declared_writes_scope_local_resync():
     """A declared write that shadows a loop-bound name must not leave the
     scope local stale: the bridge resyncs it."""
     source = (
-        "{% for x in items %}{% store as x %}S{{ forloop.counter }}{% endstore %}"
+        "{% for x in items %}{% capture x %}S{{ forloop.counter }}{% endcapture %}"
         "{{ x }};{% endfor %}"
     )
     assert_identical_and_compiled(source)
@@ -1333,7 +1333,7 @@ def test_declared_writes_scope_local_resync():
 
 def test_declared_writes_shareable():
     template = make_backend(DTCTemplates, builtins=["support"]).from_string(
-        "{% store as r %}v{% endstore %}{{ r }}"
+        "{% capture r %}v{% endcapture %}{{ r }}"
     )
     assert template._compiled.__dtc_shareable__
 
@@ -1341,10 +1341,10 @@ def test_declared_writes_shareable():
 def test_check_declarations_allows_declared_writes(monkeypatch):
     monkeypatch.setenv("DTC_CHECK_DECLARATIONS", "1")
     assert_identical_and_compiled(
-        "{% store as r %}x={{ name }}{% endstore %}{{ r }}"
+        "{% capture r %}x={{ name }}{% endcapture %}{{ r }}"
     )
     template = make_backend(DTCTemplates, builtins=["support"]).from_string(
-        "{% store as r %}v{% endstore %}{{ r }}"
+        "{% capture r %}v{% endcapture %}{{ r }}"
     )
     assert "_checked_safe_render(_node_0, context, _writes_0)" in (
         template._compiled.__dtc_source__
@@ -1390,7 +1390,7 @@ def test_declare_writes_helper():
     import dtc
     from django import template
 
-    class LocalStore(template.Node):
+    class LocalSetter(template.Node):
         def __init__(self):
             self.target = "t"
 
@@ -1398,21 +1398,21 @@ def test_declare_writes_helper():
             context[self.target] = "v"
             return ""
 
-    assert dtc.declare_writes(LocalStore, "target") is LocalStore
-    assert LocalStore.dtc_context_writes == ("target",)
+    assert dtc.declare_writes(LocalSetter, "target") is LocalSetter
+    assert LocalSetter.dtc_context_writes == ("target",)
 
-    class Sub(LocalStore):
+    class Sub(LocalSetter):
         pass
 
     from dtc.compiler import _declared_writes
 
     assert _declared_writes(Sub()) == frozenset({"t"})  # inherited
-    assert _declared_writes(LocalStore()) == frozenset({"t"})
+    assert _declared_writes(LocalSetter()) == frozenset({"t"})
 
     with pytest.raises(TypeError):
         dtc.declare_writes(lambda ctx: "")  # not a Node class
     with pytest.raises(TypeError):
-        dtc.declare_writes(LocalStore, 42)  # attr names must be strings
+        dtc.declare_writes(LocalSetter, 42)  # attr names must be strings
 
 
 def test_declared_writes_none_target_is_optional():
@@ -1422,60 +1422,60 @@ def test_declared_writes_none_target_is_optional():
 
     from dtc.compiler import _declared_writes
 
-    class MaybeStore(template.Node):
-        dtc_context_writes = ("save_to",)
+    class OptionalSetter(template.Node):
+        dtc_context_writes = ("dest",)
 
-        def __init__(self, save_to):
-            self.save_to = save_to
+        def __init__(self, dest):
+            self.dest = dest
 
         def render(self, context):
-            if self.save_to is not None:
-                context[self.save_to] = "v"
+            if self.dest is not None:
+                context[self.dest] = "v"
             return ""
 
-    assert _declared_writes(MaybeStore("x")) == frozenset({"x"})
-    assert _declared_writes(MaybeStore(None)) == frozenset()
-    assert _declared_writes(MaybeStore(42)) is None  # unusable: stays opaque
+    assert _declared_writes(OptionalSetter("x")) == frozenset({"x"})
+    assert _declared_writes(OptionalSetter(None)) == frozenset()
+    assert _declared_writes(OptionalSetter(42)) is None  # unusable: stays opaque
 
 
-# --- root-layer writes ({% remember %}) and the snapshot root exclusion ------
+# --- root-layer writes ({% export %}) and the snapshot root exclusion --------
 
 
-def test_remember_differential():
-    assert_identical_and_compiled("{% remember 42 as answer %}[{{ answer }}]")
+def test_export_differential():
+    assert_identical_and_compiled("{% export answer 42 %}[{{ answer }}]")
     assert_identical_and_compiled(
-        "{% remember name as saved %}{{ saved }}" + FLAT_MANY
+        "{% export saved name %}{{ saved }}" + FLAT_MANY
     )
-    assert_identical_and_compiled("{% remember missing as m %}[{{ m }}]")
+    assert_identical_and_compiled("{% export m missing %}[{{ m }}]")
     # A root write shadowed by a loop scope: reads inside the loop see the
-    # loop variable, reads after see the remembered value.
+    # loop variable, reads after see the exported value.
     assert_identical_and_compiled(
-        "{% for x in items %}{% remember 'deep' as x %}{{ x }};{% endfor %}[{{ x }}]"
+        "{% for x in items %}{% export x 'deep' %}{{ x }};{% endfor %}[{{ x }}]"
     )
 
 
-def test_remember_persists_across_include():
-    """The tag's purpose: remembered in an included template, read in the
+def test_export_persists_across_include():
+    """The tag's purpose: exported from an included template, read in the
     parent — through the parent's flat snapshot."""
     templates = {
         "main.html": FLAT_MANY + "{% include 'sets.html' %}[{{ answer }}]",
-        "sets.html": "{% remember 42 as answer %}",
+        "sets.html": "{% export answer 42 %}",
     }
     template, out = render_named_both(templates, "main.html")
     assert out.endswith("[42]")
     assert "_flat_get" in template._compiled.__dtc_source__  # snapshot active
 
 
-def test_remember_reremember_not_served_stale():
+def test_export_rewrite_not_served_stale():
     """The case the root exclusion exists for: a unit whose snapshot was
-    taken while a remembered name was already set, with a nested template
-    re-remembering it before a later read. A snapshot including the root
+    taken while an exported name was already set, with a nested template
+    re-exporting it before a later read. A snapshot including the root
     layer would serve the first value; stock serves the second."""
     templates = {
         "main.html": "{% include 'first.html' %}{% include 'reader.html' %}",
-        "first.html": "{% remember 'v1' as rx %}",
+        "first.html": "{% export rx 'v1' %}",
         "reader.html": FLAT_MANY + "[{{ rx }}]{% include 'second.html' %}[{{ rx }}]",
-        "second.html": "{% remember 'v2' as rx %}",
+        "second.html": "{% export rx 'v2' %}",
     }
     template, out = render_named_both(templates, "main.html")
     assert out.endswith("[v1][v2]")
@@ -1483,12 +1483,12 @@ def test_remember_reremember_not_served_stale():
 
 def test_check_declarations_allows_root_write(monkeypatch):
     monkeypatch.setenv("DTC_CHECK_DECLARATIONS", "1")
-    assert_identical_and_compiled("{% remember 42 as answer %}[{{ answer }}]")
+    assert_identical_and_compiled("{% export answer 42 %}[{{ answer }}]")
 
 
-def test_remember_shareable():
+def test_export_shareable():
     template = make_backend(DTCTemplates, builtins=["support"]).from_string(
-        "{% remember 1 as n %}"
+        "{% export n 1 %}"
     )
     assert template._compiled.__dtc_shareable__
 

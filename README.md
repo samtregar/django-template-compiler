@@ -77,7 +77,7 @@ A custom tag without dedicated codegen renders through its own `render()` agains
 Most tags never write the context. If yours is one of them, declare it:
 
 ```python
-class DivideNode(Node):
+class BreadcrumbNode(Node):
     dtc_context_safe = True   # stock Django ignores this; dtc keeps its
     ...                       # optimizations around the tag
 
@@ -97,20 +97,20 @@ The declaration is a promise about every `render()` call: the context stack and 
 Tags that *do* write the context can declare **what** they write instead, as long as the target names are fixed at parse time — the common capture/setter shape:
 
 ```python
-class StoreNode(Node):
+class CaptureNode(Node):
     # names the instance attributes holding the written context keys
-    dtc_context_writes = ("save_to",)
+    dtc_context_writes = ("target",)
 
-    def __init__(self, nodelist, save_to):
+    def __init__(self, nodelist, target):
         self.nodelist = nodelist
-        self.save_to = save_to          # {% store as NAME %}...{% endstore %}
+        self.target = target            # {% capture NAME %}...{% endcapture %}
 
     def render(self, context):
-        context[self.save_to] = self.nodelist.render(context)
+        context[self.target] = self.nodelist.render(context)
         return ""
 
 # or for classes you can't edit:
-dtc.declare_writes(SomeCaptureNode, "save_to")
+dtc.declare_writes(SomeVendorSetterNode, "dest")
 ```
 
 The compiler routes reads of the declared names through the live context and keeps every optimization on for everything else — including scope locals: if a declared write shadows a `{% for %}`/`{% with %}` name, the generated code re-reads that local right after the tag runs. The rest of the contract matches `dtc_context_safe`; the declared keys may be *set* only (no deletions), and an attribute holding `None` means an optional target unused at that site. See `help(dtc.declare_writes)`.
@@ -119,7 +119,7 @@ Declared writes may target the normal top-of-stack (`context[key] = value`) **or
 
 A wrong declaration produces wrong output silently — so verify it: run your test suite with `DTC_CHECK_DECLARATIONS=1` and dtc checks every declared render, raising `dtc.ContextSafeViolation` on any write outside the declaration. (Containers wrapping legitimate writers are skipped by the checker; the source-determinism clause isn't mechanically checkable.)
 
-Tags that just compute a value from their arguments — like the division example above — are better rewritten as `@register.simple_tag`: those compile natively, declaration-free, with argument resolution inlined.
+Tags that just compute a value from their arguments — a formatter, a calculator, a lookup — are better rewritten as `@register.simple_tag`: those compile natively, declaration-free, with argument resolution inlined.
 
 ### Limitation: tags that rewrite enclosing context layers
 

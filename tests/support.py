@@ -182,60 +182,56 @@ def ctx_reader_safe(context, key):
 ctx_reader_safe.dtc_context_safe = True
 
 
-class StoreNode(template.Node):
-    """A capture tag: renders its body and stores the result in a context
+class CaptureNode(template.Node):
+    """A capture tag: renders its body and binds the result to a context
     variable whose name is fixed at parse time — the declared-writes case."""
 
-    dtc_context_writes = ("save_to",)
+    dtc_context_writes = ("target",)
     child_nodelists = ("nodelist",)
 
-    def __init__(self, nodelist, save_to):
+    def __init__(self, nodelist, target):
         self.nodelist = nodelist
-        self.save_to = save_to
+        self.target = target
 
     def render(self, context):
-        context[self.save_to] = self.nodelist.render(context)
+        context[self.target] = self.nodelist.render(context)
         return ""
 
 
 @register.tag
-def store(parser, token):
-    """{% store as name %}...{% endstore %}"""
-    pieces = token.split_contents()
-    if len(pieces) != 3 or pieces[1] != "as":
-        raise template.TemplateSyntaxError("usage: {% store as name %}")
-    nodelist = parser.parse(("endstore",))
+def capture(parser, token):
+    """{% capture name %}...{% endcapture %}"""
+    bits = token.split_contents()
+    if len(bits) != 2:
+        raise template.TemplateSyntaxError("usage: {% capture name %}")
+    nodelist = parser.parse(("endcapture",))
     parser.delete_first_token()
-    return StoreNode(nodelist, pieces[2])
+    return CaptureNode(nodelist, bits[1])
 
 
-class RememberNode(template.Node):
-    """A root-layer writer: persists a value across templates by writing
-    context.dicts[0] — the declared-writes case whose write outlives every
-    scope pop."""
+class ExportNode(template.Node):
+    """A root-layer writer: publishes a value to context.dicts[0] so it
+    survives every scope pop and crosses template boundaries — the
+    declared-writes case whose write outlives the tag's own template."""
 
-    dtc_context_writes = ("save_to",)
+    dtc_context_writes = ("target",)
 
-    def __init__(self, save_from, save_to):
-        self.save_from = save_from
-        self.save_to = save_to
+    def __init__(self, target, value):
+        self.target = target
+        self.value = value
 
     def render(self, context):
-        try:
-            result = self.save_from.resolve(context)
-        except template.VariableDoesNotExist:
-            result = None
-        context.dicts[0][self.save_to] = result
+        context.dicts[0][self.target] = self.value.resolve(context)
         return ""
 
 
 @register.tag
-def remember(parser, token):
-    """{% remember value as name %}"""
-    pieces = token.split_contents()
-    if len(pieces) != 4 or pieces[2] != "as":
-        raise template.TemplateSyntaxError("usage: {% remember value as name %}")
-    return RememberNode(parser.compile_filter(pieces[1]), pieces[3])
+def export(parser, token):
+    """{% export name value %}"""
+    bits = token.split_contents()
+    if len(bits) != 3:
+        raise template.TemplateSyntaxError("usage: {% export name value %}")
+    return ExportNode(bits[1], parser.compile_filter(bits[2]))
 
 
 def make_backend(cls, **options):
