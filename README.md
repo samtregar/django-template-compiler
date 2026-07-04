@@ -129,6 +129,10 @@ A tag that mutates an *intermediate* layer of the caller's stack — indexing `c
 
 If you have such a tag, the supported paths are: write the root layer instead (`dicts[0]` — fully supported and declarable), write the top of the stack, or confine the mutation to the template that renders the tag. Note that intermediate-layer writes are fragile under stock Django too — what `dicts[1]` *is* depends on the stack depth at the call site.
 
+### Limitation: `override_settings` entered mid-render
+
+Compiled code reads `USE_THOUSAND_SEPARATOR` (which controls `{{ int }}` formatting) through the concrete settings object behind the `django.conf.settings` proxy, re-resolved at the start of every render and after every bridged tag, `takes_context` call, and slow-path replay. Assigning a setting directly (`settings.USE_THOUSAND_SEPARATOR = True`), from anywhere — even a filter — writes through to that object and is observed by the very next output, exactly like stock. The one mutation that isn't: calling `override_settings().enable()` from a *filter* or a non-`takes_context` tag and leaving it active across the call boundary. That swaps the object behind the proxy, and compiled int outputs keep reading the old one until the next bridged-tag/`takes_context`/replay site, where stock Django observes the swap immediately. `override_settings` used as intended — wrapped around a render, in tests — is always exact, as is entering/exiting it from a bridged (unrecognized) tag.
+
 ## Development
 
 ```bash

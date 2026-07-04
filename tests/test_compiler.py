@@ -1671,3 +1671,50 @@ def test_known_limitation_intermediate_layer_writes():
     assert out.endswith("[original]")  # dtc's snapshot predates it: the
     # documented divergence — exactness holds only for scope-limited or
     # root-layer cross-template effects
+
+
+def test_known_limitation_settings_override_from_filter():
+    """Documents the settings-holder boundary (README "Limitation"): the
+    int fast path reads USE_THOUSAND_SEPARATOR through the concrete
+    settings object behind the LazySettings proxy, re-grabbed per render
+    and at every bridge/replay/takes_context resync site. A filter (or
+    non-takes_context tag) calling override_settings().enable() swaps the
+    object behind the proxy with no resync site in between, so compiled
+    int outputs keep the pre-swap value where stock groups immediately.
+    Asserts the divergence deliberately: if this starts failing, the
+    boundary moved and README/CLAUDE.md must be updated with it. (Direct
+    settings *assignment* writes through the proxy to the held object and
+    stays exact — test_thousand_separator_assigned_mid_render_by_bridged_tag;
+    override swaps from bridged tags are also exact —
+    test_thousand_separator_override_swap_mid_render.)"""
+    from django import template as dj_template
+    from django.test import override_settings
+
+    lib = dj_template.Library()
+
+    @lib.filter
+    def sneaky_override(value):
+        override_settings(USE_THOUSAND_SEPARATOR=True).enable()
+        return value
+
+    source = "{{ big|sneaky_override }};{{ big }}"
+    context = {"big": 1234567}
+
+    dtc_backend = make_backend(DTCTemplates)
+    django_backend = make_backend(DjangoTemplates)
+    for backend in (dtc_backend, django_backend):
+        backend.engine.template_builtins.append(lib)
+
+    # Each render leaks its enable(); the surrounding override_settings
+    # gives it a throwaway holder and restores the real one on exit.
+    with override_settings(USE_THOUSAND_SEPARATOR=False):
+        stock = django_backend.from_string(source).render(dict(context))
+    dtc_template = dtc_backend.from_string(source)
+    assert dtc_template._compiled is not None
+    with override_settings(USE_THOUSAND_SEPARATOR=False):
+        out = dtc_template.render(dict(context))
+
+    # Stock reads live per value, so even the output the filter ran in
+    # groups — a same-site effect no resync placement could reproduce.
+    assert stock == "1,234,567;1,234,567"
+    assert out == "1234567;1234567"  # the documented divergence

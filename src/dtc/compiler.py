@@ -654,11 +654,15 @@ else:
 # Values reached through Variable.resolve in conditions and filter arguments
 # are excluded: Django never passes those callables the context.
 # The per-render settings holder is re-grabbed at the same sites: such code
-# may enter/exit override_settings, which swaps settings._wrapped. (Foreign
+# may enter/exit override_settings, which swaps settings._wrapped. Foreign
 # code that swaps the holder from a site with no resync — a filter or a
 # non-takes_context tag doing override_settings().enable() mid-render — is
 # seen at the next resync rather than instantly; direct settings mutations
-# write through to the held object and are always seen instantly.)
+# write through to the held object and are always seen instantly. That gap
+# is a documented compatibility boundary (README "Limitation", pinned by
+# test_known_limitation_settings_override_from_filter): closing it would
+# mean re-reading the holder after every filter call and condition eval,
+# the hot paths the holder exists to speed up.
 _RESYNC_FOREIGN = (
     "_autoescape = context.autoescape\n_settings = _settings_holder()\n"
 )
