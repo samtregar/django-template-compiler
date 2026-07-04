@@ -202,9 +202,12 @@ def _preamble(flat):
     )
     if flat:
         # Immutable read snapshot for names this unit never writes; same
-        # layer precedence as the context walk. Taken per function
+        # layer precedence as the context walk, except the root layer is
+        # excluded (see runtime.flatten_tail): root writes from nested
+        # templates outlive scope pops, and a snapshot miss replays through
+        # the live walk while a stale hit would not. Taken per function
         # invocation, so block bodies see the caller's live scopes.
-        lines += "    _flat_get = context.flatten().get\n"
+        lines += "    _flat_get = _flatten_tail(context).get\n"
     return lines
 
 
@@ -226,10 +229,14 @@ def _declared_writes(node):
     opaque. ``dtc_context_writes`` (raw nodes only; see
     ``dtc.declare_writes``) names the *instance attributes* holding the
     written key names, since targets like ``{% store ... as x %}`` are
-    parse-time data; ``dtc_context_safe`` is the writes-nothing case. An
-    attribute holding None means the optional target is unused at this
-    site; anything else non-string makes the declaration unusable and the
-    node stays opaque."""
+    parse-time data; ``dtc_context_safe`` is the writes-nothing case. The
+    writes may set the keys on the effective top of the stack
+    (``context[k] = v``) or the root layer (``context.dicts[0][k] = v`` —
+    safe because the flat snapshot excludes the root layer, see
+    ``runtime.flatten_tail``), but not intermediate layers, and never
+    delete. An attribute holding None means the optional target is unused
+    at this site; anything else non-string makes the declaration unusable
+    and the node stays opaque."""
     node_type = type(node)
     if node_type in (SimpleNode, InclusionNode):
         return frozenset() if _is_declared_safe(node) else None
@@ -737,6 +744,7 @@ class _Codegen:
             "_template_render": runtime.template_render,
             "_checked_safe_render": runtime.checked_safe_render,
             "_checked_safe_call": runtime.checked_safe_call,
+            "_flatten_tail": runtime.flatten_tail,
             "_conditional_escape": conditional_escape,
             "_settings": settings,
             "_strip_spaces": strip_spaces_between_tags,

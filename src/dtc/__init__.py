@@ -96,8 +96,12 @@ def declare_writes(node_class, *attr_names):
         #     dtc_context_writes = ("save_to",)
 
     The promise, per ``render()`` call: the only context mutations are
-    ``context[k] = value`` for keys held in the named attributes — no other
-    writes, no deletions, no net push/pop, and clauses (b)–(d) of the
+    setting the named keys — on the effective top of the stack
+    (``context[k] = value``) or on the root layer
+    (``context.dicts[0][k] = value``, the pattern of tags that persist a
+    value across template boundaries) — no other writes, no intermediate
+    layers, no
+    deletions, no net push/pop, and clauses (b)–(d) of the
     ``declare_safe`` contract. An attribute holding None means an optional
     target unused at that site. With no attributes this is equivalent to
     ``declare_safe``. Only Node subclasses can declare writes (a

@@ -1000,7 +1000,7 @@ def test_flat_snapshot_differential():
 def test_flat_snapshot_emitted_and_gated():
     source_of = lambda t: t._compiled.__dtc_source__
     big = make_backend(DTCTemplates).from_string(FLAT_MANY)
-    assert "_flat_get = context.flatten().get" in source_of(big)
+    assert "_flat_get = _flatten_tail(context).get" in source_of(big)
     assert "_flat_get('name'" in source_of(big)
 
     small = make_backend(DTCTemplates).from_string("{{ name }}")
@@ -1436,3 +1436,107 @@ def test_declared_writes_none_target_is_optional():
     assert _declared_writes(MaybeStore("x")) == frozenset({"x"})
     assert _declared_writes(MaybeStore(None)) == frozenset()
     assert _declared_writes(MaybeStore(42)) is None  # unusable: stays opaque
+
+
+# --- root-layer writes ({% remember %}) and the snapshot root exclusion ------
+
+
+def test_remember_differential():
+    assert_identical_and_compiled("{% remember 42 as answer %}[{{ answer }}]")
+    assert_identical_and_compiled(
+        "{% remember name as saved %}{{ saved }}" + FLAT_MANY
+    )
+    assert_identical_and_compiled("{% remember missing as m %}[{{ m }}]")
+    # A root write shadowed by a loop scope: reads inside the loop see the
+    # loop variable, reads after see the remembered value.
+    assert_identical_and_compiled(
+        "{% for x in items %}{% remember 'deep' as x %}{{ x }};{% endfor %}[{{ x }}]"
+    )
+
+
+def test_remember_persists_across_include():
+    """The tag's purpose: remembered in an included template, read in the
+    parent — through the parent's flat snapshot."""
+    templates = {
+        "main.html": FLAT_MANY + "{% include 'sets.html' %}[{{ answer }}]",
+        "sets.html": "{% remember 42 as answer %}",
+    }
+    template, out = render_named_both(templates, "main.html")
+    assert out.endswith("[42]")
+    assert "_flat_get" in template._compiled.__dtc_source__  # snapshot active
+
+
+def test_remember_reremember_not_served_stale():
+    """The case the root exclusion exists for: a unit whose snapshot was
+    taken while a remembered name was already set, with a nested template
+    re-remembering it before a later read. A snapshot including the root
+    layer would serve the first value; stock serves the second."""
+    templates = {
+        "main.html": "{% include 'first.html' %}{% include 'reader.html' %}",
+        "first.html": "{% remember 'v1' as rx %}",
+        "reader.html": FLAT_MANY + "[{{ rx }}]{% include 'second.html' %}[{{ rx }}]",
+        "second.html": "{% remember 'v2' as rx %}",
+    }
+    template, out = render_named_both(templates, "main.html")
+    assert out.endswith("[v1][v2]")
+
+
+def test_check_declarations_allows_root_write(monkeypatch):
+    monkeypatch.setenv("DTC_CHECK_DECLARATIONS", "1")
+    assert_identical_and_compiled("{% remember 42 as answer %}[{{ answer }}]")
+
+
+def test_remember_shareable():
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% remember 1 as n %}"
+    )
+    assert template._compiled.__dtc_shareable__
+
+
+def test_known_limitation_intermediate_layer_writes():
+    """Documents the one compatibility boundary (README "Limitation"): a
+    tag that mutates an INTERMEDIATE context layer from inside an include
+    can stale the enclosing template's snapshot or scope locals — the
+    enclosing template compiles without knowledge of the tag. This test
+    asserts the divergence deliberately: if it starts failing, the
+    boundary moved and the README/CLAUDE.md must be updated with it.
+    (Same-template use of such tags stays exact and differential-tested;
+    root-layer writes are exact via the snapshot's dicts[0] exclusion.)"""
+    from django import template as dj_template
+
+    lib = dj_template.Library()
+
+    class LayerSurgeryNode(dj_template.Node):
+        def render(self, context):
+            context.set_upward("marker", "changed")  # nearest enclosing layer
+            return ""
+
+    @lib.tag
+    def layer_surgery(parser, token):
+        return LayerSurgeryNode()
+
+    templates = {
+        "parent.html": FLAT_MANY + "{% include 'surgeon.html' %}[{{ marker }}]",
+        "surgeon.html": "{% layer_surgery %}",
+    }
+    options = {
+        "loaders": [("django.template.loaders.locmem.Loader", templates)],
+        "builtins": ["support"],
+    }
+    context = dict(base_context(), marker="original")
+
+    dtc_backend = make_backend(DTCTemplates, **options)
+    django_backend = make_backend(DjangoTemplates, **options)
+    # Register the library on both engines directly (it's test-local).
+    for backend in (dtc_backend, django_backend):
+        backend.engine.template_builtins.append(lib)
+
+    stock = django_backend.get_template("parent.html").render(dict(context))
+    dtc_template = dtc_backend.get_template("parent.html")
+    assert dtc_template._compiled is not None
+    out = dtc_template.render(dict(context))
+
+    assert stock.endswith("[changed]")  # stock sees the mutation immediately
+    assert out.endswith("[original]")  # dtc's snapshot predates it: the
+    # documented divergence — exactness holds only for scope-limited or
+    # root-layer cross-template effects

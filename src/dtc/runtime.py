@@ -202,6 +202,22 @@ def render_extends(node, context):
         return render_body(compiled_parent, context)
 
 
+def flatten_tail(context):
+    """``Context.flatten()`` minus the root layer (``dicts[0]``). The flat
+    read snapshot deliberately excludes it: a root write —
+    ``context.dicts[0][k] = v``, the pattern tags use to persist a value
+    across template boundaries, outliving every scope pop — must
+    never be served stale from a snapshot taken before the write. Excluded,
+    root-resolved names miss the snapshot and replay through the live
+    context walk, which is always fresh. Nothing legitimate is lost: the
+    root layer holds only the context builtins, and ``True``/``False``/
+    ``None`` parse as literals, never as variable lookups."""
+    flat = {}
+    for d in context.dicts[1:]:
+        flat.update(d)
+    return flat
+
+
 def _context_snapshot(context):
     return [dict(d) for d in context.dicts]
 

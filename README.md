@@ -115,9 +115,19 @@ dtc.declare_writes(SomeCaptureNode, "save_to")
 
 The compiler routes reads of the declared names through the live context and keeps every optimization on for everything else — including scope locals: if a declared write shadows a `{% for %}`/`{% with %}` name, the generated code re-reads that local right after the tag runs. The rest of the contract matches `dtc_context_safe`; the declared keys may be *set* only (no deletions), and an attribute holding `None` means an optional target unused at that site. See `help(dtc.declare_writes)`.
 
+Declared writes may target the normal top-of-stack (`context[key] = value`) **or** the root layer (`context.dicts[0][key] = value` — the pattern used by tags that persist a value across template boundaries, past every scope pop). Root-written names are never served from the read snapshot (it excludes the root layer by design), so they stay exact across template boundaries, includes, and re-writes.
+
 A wrong declaration produces wrong output silently — so verify it: run your test suite with `DTC_CHECK_DECLARATIONS=1` and dtc checks every declared render, raising `dtc.ContextSafeViolation` on any write outside the declaration. (Containers wrapping legitimate writers are skipped by the checker; the source-determinism clause isn't mechanically checkable.)
 
 Tags that just compute a value from their arguments — like the division example above — are better rewritten as `@register.simple_tag`: those compile natively, declaration-free, with argument resolution inlined.
+
+### Limitation: tags that rewrite enclosing context layers
+
+Within a single template, *any* custom tag is rendered exactly — the compiler disables its read optimizations around every tag it doesn't recognize. Across template boundaries there is one assumption: a tag's context effects that outlive an `{% include %}`/`{% block %}`/`{% extends %}` are either **scope-limited** (ordinary `context[key] = value` writes and balanced push/pop, which die with the layers that the include/block machinery pops) or **root-layer** (`context.dicts[0][key] = value`, which dtc handles as described above). Every Django built-in and every `simple_tag`/`inclusion_tag` satisfies this.
+
+A tag that mutates an *intermediate* layer of the caller's stack — indexing `context.dicts[1]`, calling `Context.set_upward()`, deleting keys from enclosing layers, or leaking an unbalanced `push()` — from inside an included or extended template **can produce output that differs from stock Django**: the enclosing template was compiled without knowledge of that tag, and its read snapshot or scope locals may serve the pre-mutation value. `DTC_CHECK_DECLARATIONS` cannot catch this (the tag carries no declaration, and the effect surfaces in a different template than the tag).
+
+If you have such a tag, the supported paths are: write the root layer instead (`dicts[0]` — fully supported and declarable), write the top of the stack, or confine the mutation to the template that renders the tag. Note that intermediate-layer writes are fragile under stock Django too — what `dicts[1]` *is* depends on the stack depth at the call site.
 
 ## Development
 

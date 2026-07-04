@@ -209,6 +209,35 @@ def store(parser, token):
     return StoreNode(nodelist, pieces[2])
 
 
+class RememberNode(template.Node):
+    """A root-layer writer: persists a value across templates by writing
+    context.dicts[0] — the declared-writes case whose write outlives every
+    scope pop."""
+
+    dtc_context_writes = ("save_to",)
+
+    def __init__(self, save_from, save_to):
+        self.save_from = save_from
+        self.save_to = save_to
+
+    def render(self, context):
+        try:
+            result = self.save_from.resolve(context)
+        except template.VariableDoesNotExist:
+            result = None
+        context.dicts[0][self.save_to] = result
+        return ""
+
+
+@register.tag
+def remember(parser, token):
+    """{% remember value as name %}"""
+    pieces = token.split_contents()
+    if len(pieces) != 4 or pieces[2] != "as":
+        raise template.TemplateSyntaxError("usage: {% remember value as name %}")
+    return RememberNode(parser.compile_filter(pieces[1]), pieces[3])
+
+
 def make_backend(cls, **options):
     return cls(
         {
