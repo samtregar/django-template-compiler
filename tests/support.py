@@ -120,6 +120,68 @@ def aoff(parser, token):
     return AutoescapeOffNode()
 
 
+class ContextPeekNode(template.Node):
+    """Positive twin of ContextPokeNode: a read-only third-party-style node,
+    declared context-safe."""
+
+    dtc_context_safe = True
+
+    def __init__(self, var):
+        self.var = template.Variable(var)
+
+    def render(self, context):
+        try:
+            return f"<{self.var.resolve(context)}>"
+        except template.VariableDoesNotExist:
+            return ""
+
+
+@register.tag
+def peek(parser, token):
+    return ContextPeekNode(token.split_contents()[1])
+
+
+class SafeAutoescapeOffNode(AutoescapeOffNode):
+    """Declared-safe node that flips autoescape — allowed by the contract;
+    the bridge's autoescape resync keeps it exact."""
+
+    dtc_context_safe = True
+
+
+@register.tag
+def aoff_safe(parser, token):
+    return SafeAutoescapeOffNode()
+
+
+class SafeWrapNode(template.Node):
+    """Declared-safe container: renders its (listed) child nodelist against
+    the live context. Children speak for themselves — contract clause (d)."""
+
+    dtc_context_safe = True
+    child_nodelists = ("nodelist",)
+
+    def __init__(self, nodelist):
+        self.nodelist = nodelist
+
+    def render(self, context):
+        return f"[{self.nodelist.render(context)}]"
+
+
+@register.tag
+def safewrap(parser, token):
+    nodelist = parser.parse(("endsafewrap",))
+    parser.delete_first_token()
+    return SafeWrapNode(nodelist)
+
+
+@register.simple_tag(takes_context=True)
+def ctx_reader_safe(context, key):
+    return f"[{context.get(key, 'absent')}]"
+
+
+ctx_reader_safe.dtc_context_safe = True
+
+
 def make_backend(cls, **options):
     return cls(
         {

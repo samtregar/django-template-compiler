@@ -1056,3 +1056,231 @@ def test_codegen_shape_filters():
     assert "_filter_0_0(_input, _arg_0_0_0, autoescape=_autoescape)" in source
     assert "_filter_0_1(_value)" in source  # upper
     assert "except UnicodeDecodeError:" in source  # VariableNode.render's catch
+
+
+# --- dtc_context_safe declarations ------------------------------------------
+
+
+def test_declared_safe_node_differential():
+    assert_identical_and_compiled("{% peek name %}")
+    assert_identical_and_compiled("{% peek missing %}")
+    assert_identical_and_compiled("{% for x in items %}{% peek x %}{% endfor %}")
+    assert_identical_and_compiled("{% with y=name %}{% peek y %}{% endwith %}")
+    assert_identical_and_compiled("{% peek html %}" + FLAT_MANY)
+
+
+def test_declared_safe_node_shareable():
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% peek name %}"
+    )
+    assert template._compiled.__dtc_shareable__
+
+    options = {
+        "builtins": ["support"],
+        "loaders": [
+            (
+                "django.template.loaders.locmem.Loader",
+                {"peek.html": "{% peek name %}!"},
+            )
+        ],
+    }
+    backend = make_backend(DTCTemplates, **options)
+    first = backend.get_template("peek.html")
+    second = backend.get_template("peek.html")
+    assert first.template is not second.template  # uncached loader: new parse
+    assert first._compiled is second._compiled  # declared safe: shared
+    assert first.render(base_context()) == "<world>!"
+
+
+def test_declared_safe_keeps_flat_snapshot():
+    source_of = lambda t: t._compiled.__dtc_source__
+    safe = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% peek z %}" + FLAT_MANY
+    )
+    assert "_flat_get" in source_of(safe)
+
+    safe_fn = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% ctx_reader_safe 'name' %}" + FLAT_MANY
+    )
+    assert "_flat_get" in source_of(safe_fn)
+
+    # The undeclared twins stay gated (also covered by
+    # test_flat_snapshot_emitted_and_gated).
+    plain_fn = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% ctx_reader 'name' %}" + FLAT_MANY
+    )
+    assert "_flat_get" not in source_of(plain_fn)
+
+
+def test_scope_locals_survive_declared_safe_bridge():
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% for x in items %}{% peek x %}{{ x }}{% endfor %}"
+    )
+    source = template._compiled.__dtc_source__
+    assert "_lv0_x" in source
+    assert template.render(base_context()) == "<zero>zero<one>one<two>two"
+
+    with_tc = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% for x in items %}{% ctx_reader_safe 'x' %}{{ x }}{% endfor %}"
+    )
+    assert "_lv0_x" in with_tc._compiled.__dtc_source__
+
+
+def test_declared_safe_still_forces_forloop():
+    """v1 declarations don't enumerate reads: a safe tag may resolve
+    forloop.counter, so the dict must be maintained."""
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% for x in items %}{% peek forloop.counter %}{% endfor %}"
+    )
+    assert "'parentloop'" in template._compiled.__dtc_source__
+    assert template.render(base_context()) == "<1><2><3>"
+
+
+def test_safe_container_differential():
+    assert_identical_and_compiled("{% safewrap %}a {{ name }} b{% endsafewrap %}")
+    assert_identical_and_compiled(
+        "{% safewrap %}{% for x in items %}{{ x }}{% endfor %}{% endsafewrap %}"
+    )
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% safewrap %}{{ name }}{% endsafewrap %}"
+    )
+    assert template._compiled.__dtc_shareable__
+
+
+def test_safe_container_nested_writers():
+    """A safe container's children speak for themselves (contract clause d):
+    nested writers must still poison flattening, scope locals, and the
+    written-name set."""
+    source_of = lambda t: t._compiled.__dtc_source__
+
+    nested_opaque = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% safewrap %}{% poke z %}{% endsafewrap %}" + FLAT_MANY
+    )
+    assert "_flat_get" not in source_of(nested_opaque)
+    assert_identical_and_compiled(
+        "{% safewrap %}{% poke z %}{% endsafewrap %}{{ z }}" + FLAT_MANY
+    )
+
+    in_loop = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% for x in items %}{% safewrap %}{% poke x %}{% endsafewrap %}{{ x }}{% endfor %}"
+    )
+    assert "_lv" not in source_of(in_loop)
+    assert in_loop.render(base_context()) == "[<poke>]poked" * 3
+
+    nested_writer = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% safewrap %}{% stamp 'v' as y %}{% endsafewrap %}{{ y }}" + FLAT_MANY
+    )
+    assert "_flat_get('name'" in source_of(nested_writer)  # snapshot survives
+    assert "_flat_get('y'" not in source_of(nested_writer)  # written name walks
+    assert_identical_and_compiled(
+        "{% safewrap %}{% stamp 'v' as y %}{% endsafewrap %}{{ y }}" + FLAT_MANY
+    )
+
+
+def test_declared_safe_autoescape_flip():
+    """Flipping context.autoescape is outside the contract: the bridge
+    resync keeps a declared-safe flipper exact."""
+    assert_identical_and_compiled("{% aoff_safe %}{{ html }}")
+    assert_identical_and_compiled(
+        "{% autoescape off %}{% aoff_safe %}{{ html }}{% endautoescape %}{{ html }}"
+    )
+
+
+def test_check_declarations_catches_lying_node(monkeypatch):
+    import dtc
+    import support
+
+    monkeypatch.setattr(
+        support.ContextPokeNode, "dtc_context_safe", True, raising=False
+    )
+    monkeypatch.setenv("DTC_CHECK_DECLARATIONS", "1")
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% poke z %}"
+    )
+    with pytest.raises(dtc.ContextSafeViolation, match="ContextPokeNode"):
+        template.render(base_context())
+
+
+def test_lying_declaration_silent_without_check_mode(monkeypatch):
+    import support
+
+    monkeypatch.setattr(
+        support.ContextPokeNode, "dtc_context_safe", True, raising=False
+    )
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% poke z %}"
+    )
+    assert template.render(base_context()) == "<poke>"
+
+
+def test_check_declarations_catches_lying_function(monkeypatch):
+    import dtc
+    import support
+
+    monkeypatch.setattr(support.ctx_set, "dtc_context_safe", True, raising=False)
+    monkeypatch.setenv("DTC_CHECK_DECLARATIONS", "1")
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% ctx_set 'z' 'v' %}"
+    )
+    with pytest.raises(dtc.ContextSafeViolation, match="ctx_set"):
+        template.render(base_context())
+
+
+def test_check_declarations_passes_honest(monkeypatch):
+    monkeypatch.setenv("DTC_CHECK_DECLARATIONS", "1")
+    assert_identical_and_compiled("{% peek name %}" + FLAT_MANY)
+    assert_identical_and_compiled("{% safewrap %}{{ name }}{% endsafewrap %}")
+    assert_identical_and_compiled("{% ctx_reader_safe 'name' %}")
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% peek name %}"
+    )
+    assert "_checked_safe_render" in template._compiled.__dtc_source__
+
+
+def test_check_declarations_skips_containers_with_writers(monkeypatch):
+    """A safe container wrapping a legitimate writer (contract clause d)
+    must bridge unchecked, or the checker would false-positive."""
+    monkeypatch.setenv("DTC_CHECK_DECLARATIONS", "1")
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% safewrap %}{% poke z %}{% endsafewrap %}{{ z }}"
+    )
+    assert "_checked_safe_render" not in template._compiled.__dtc_source__
+    assert template.render(base_context()) == "[<poke>]poked"
+
+
+def test_declare_safe_helper():
+    import dtc
+    from django import template
+
+    class LocalNode(template.Node):
+        def render(self, context):
+            return ""
+
+    assert dtc.declare_safe(LocalNode) is LocalNode
+    assert LocalNode.dtc_context_safe is True
+
+    def tag_fn(context):
+        return ""
+
+    assert dtc.declare_safe(tag_fn) is tag_fn
+    assert tag_fn.dtc_context_safe is True
+
+    with pytest.raises(TypeError):
+        dtc.declare_safe("not a node")
+    with pytest.raises(TypeError):
+        dtc.declare_safe(dict)  # a class, but not a Node subclass
+
+
+def test_declared_safe_inherited_by_subclass():
+    from dtc.compiler import _is_declared_safe
+
+    import support
+
+    class Inherits(support.ContextPeekNode):
+        pass
+
+    class OptsOut(support.ContextPeekNode):
+        dtc_context_safe = False
+
+    assert _is_declared_safe(Inherits("name"))
+    assert not _is_declared_safe(OptsOut("name"))

@@ -106,6 +106,17 @@ logger = logging.getLogger("dtc")
 #: fails CI loudly rather than hiding behind the fallback.
 STRICT = False
 
+#: When true (or DTC_CHECK_DECLARATIONS=1 in the environment), bridges for
+#: nodes declared ``dtc_context_safe`` render through a checked wrapper that
+#: raises ``dtc.ContextSafeViolation`` when the declaration's contract is
+#: broken. Read at compile time, like STRICT: set it before templates
+#: compile (already-compiled and source-cached functions stay unchecked).
+CHECK_DECLARATIONS = False
+
+
+def _checking_declarations():
+    return CHECK_DECLARATIONS or os.environ.get("DTC_CHECK_DECLARATIONS") == "1"
+
 # Exactly the exceptions Variable._resolve_lookup catches on the dictionary
 # lookup attempt. UnicodeDecodeError is a ValueError subclass, so it lands in
 # the slow path, whose VariableNode.render handles it as Django does.
@@ -197,6 +208,18 @@ def _preamble(flat):
     return lines
 
 
+def _is_declared_safe(node):
+    """True when a node opts into the ``dtc_context_safe`` contract (see
+    ``dtc.declare_safe``): for simple/inclusion tags the declaration rides
+    on the registered function (like ``is_safe`` on filters); for raw nodes
+    on the class, inherited by subclasses along with the ``render()`` it
+    describes (``dtc_context_safe = False`` opts back out)."""
+    node_type = type(node)
+    if node_type in (SimpleNode, InclusionNode):
+        return bool(getattr(node.func, "dtc_context_safe", False))
+    return bool(getattr(node_type, "dtc_context_safe", False))
+
+
 # Names a unit's own code writes into the context. Reads of these must use
 # the context walk (or a scope local); reads of anything else may use the
 # flattened snapshot — nothing in a flatten-safe template can change them.
@@ -232,6 +255,19 @@ def _collect_writes(nodelist, out):
             LanguageNode,
         ):
             _collect_writes(node.nodelist, out)
+        elif node_type not in _Codegen._handlers:
+            # Unknown (bridged) node, possibly a declared-context-safe
+            # container: its children render interpreted inside the bridge
+            # but still write the live context (simple_tag target_var,
+            # nested {% for %}/{% with %}, ...), so their writes must poison
+            # the flat snapshot. Over-collection only disables optimization;
+            # without a safe declaration mutation_opaque already disables
+            # flattening, making the extra names inert. The handlers guard
+            # keeps BlockNode/ExtendsNode excluded (next comment).
+            for attr in getattr(node, "child_nodelists", ()):
+                child = getattr(node, attr, None)
+                if child is not None:
+                    _collect_writes(child, out)
         # BlockNode bodies are separate units; block/include/extends
         # machinery only touches scopes it pushes and pops (net zero).
 
@@ -410,15 +446,34 @@ class _Analysis:
                 for fe in list(node.args) + list(node.kwargs.values()):
                     self._fe(fe)
                 if node.takes_context:
-                    self.mutation_opaque = True
+                    # A declared-safe function (dtc.declare_safe) promises
+                    # it never writes the context; reading stays fine either
+                    # way, so only the write-opacity is waived — it can
+                    # still read context['forloop'].
+                    if not _is_declared_safe(node):
+                        self.mutation_opaque = True
                     if in_loop:
                         self.force_forloop = True
             else:
                 # Unknown node: bridged at codegen. Its render can read
                 # (or write) anything on the live context.
-                self.mutation_opaque = True
                 if in_loop:
+                    # Even a declared-safe node may resolve forloop.counter;
+                    # v1 of the declaration doesn't enumerate reads.
                     self.force_forloop = True
+                if _is_declared_safe(node):
+                    # Declared context-safe: no net writes of its own, so
+                    # the flat snapshot survives — but children (rendered
+                    # interpreted inside the bridge) speak for themselves:
+                    # a nested unknown tag or takes_context function must
+                    # still set mutation_opaque, and their reads belong in
+                    # first_bits.
+                    for attr in getattr(node, "child_nodelists", ()):
+                        child = getattr(node, attr, None)
+                        if child is not None:
+                            self.walk(child, in_loop)
+                else:
+                    self.mutation_opaque = True
 
     def _fe(self, fe):
         if isinstance(fe.var, Variable) and fe.var.lookups:
@@ -649,6 +704,8 @@ class _Codegen:
             "_resolve_include": runtime.resolve_include,
             "_transparent_renders": runtime._transparent_renders,
             "_template_render": runtime.template_render,
+            "_checked_safe_render": runtime.checked_safe_render,
+            "_checked_safe_call": runtime.checked_safe_call,
             "_conditional_escape": conditional_escape,
             "_settings": settings,
             "_strip_spaces": strip_spaces_between_tags,
@@ -700,12 +757,42 @@ class _Codegen:
         plain passthrough to render, matching NodeList.render."""
         i = self.uid()
         self.namespace[f"_node_{i}"] = node
-        # Bridged nodes may keep per-node state keyed by their own identity
-        # (IfChangedNode, CycleNode, ...). Embedding one makes this compiled
-        # function specific to this parse: it must not be shared across
-        # same-source template instances (see runtime.compiled_for).
-        self.uses_bridges = True
+        if _is_declared_safe(node):
+            # Declared context-safe (dtc.declare_safe): contract clauses
+            # (b) no identity-keyed state and (c) same-source instances
+            # interchangeable make embedding this parse's node in a shared
+            # function exact, so this bridge does not forfeit
+            # __dtc_shareable__.
+            if _checking_declarations() and self._bridge_checkable(node):
+                return (
+                    f"_append(_checked_safe_render(_node_{i}, context))\n"
+                    + _RESYNC_AUTOESCAPE
+                )
+        else:
+            # Bridged nodes may keep per-node state keyed by their own
+            # identity (IfChangedNode, CycleNode, ...). Embedding one makes
+            # this compiled function specific to this parse: it must not be
+            # shared across same-source template instances (see
+            # runtime.compiled_for).
+            self.uses_bridges = True
         return f"_append(_node_{i}.render_annotated(context))\n" + _RESYNC_AUTOESCAPE
+
+    def _bridge_checkable(self, node):
+        """Checked emission only when the node's child subtrees are provably
+        write-free: a declared-safe container wrapping a *legitimate* writer
+        (exempt under contract clause (d)) would otherwise false-positive.
+        Leaf nodes — the common case — are trivially checkable."""
+        for attr in getattr(node, "child_nodelists", ()):
+            child = getattr(node, attr, None)
+            if child is None:
+                continue
+            if self._has_opaque(child):
+                return False
+            writes = set()
+            _collect_writes(child, writes)
+            if writes:
+                return False
+        return True
 
     # --- leaves ---------------------------------------------------------
 
@@ -792,10 +879,21 @@ class _Codegen:
         result = False
         for node in nodelist:
             node_type = type(node)
+            # A declared-safe node/function (dtc.declare_safe) never writes
+            # context names, so it can't stale a scope local. Scope locals
+            # are read only by compiled code; a safe container's interpreted
+            # children read the live context, which visit_for/visit_with
+            # always maintain in parallel. Its child_nodelists still recurse
+            # below — a nested {% poke %}-style writer stays opaque.
             if node_type not in self._handlers:
-                result = True
-                break
-            if node_type in (SimpleNode, InclusionNode) and node.takes_context:
+                if not _is_declared_safe(node):
+                    result = True
+                    break
+            elif (
+                node_type in (SimpleNode, InclusionNode)
+                and node.takes_context
+                and not _is_declared_safe(node)
+            ):
                 result = True
                 break
             for attr in getattr(node, "child_nodelists", ()):
@@ -1240,7 +1338,16 @@ class _Codegen:
                 for k, (key, fe) in enumerate(node.kwargs.items())
             )
             call_args.append(f"**{{{items}}}")
-        return f"{func_name}({', '.join(call_args)})"
+        call = f"{func_name}({', '.join(call_args)})"
+        if (
+            node.takes_context
+            and _is_declared_safe(node)
+            and _checking_declarations()
+        ):
+            # A lying declared-safe function corrupts the flat snapshot just
+            # as silently as a lying node; check mode verifies it per call.
+            return f"_checked_safe_call({func_name}, context, (lambda: {call}))"
+        return call
 
     def _arg_expr(self, fe, name):
         """An expression for one FilterExpression argument: folded when its
@@ -1302,6 +1409,11 @@ class _Codegen:
             self.namespace[f"_incl_file_{i}"] = filename.template
             resolve = f"    _incl_t = _incl_file_{i}\n"
         else:
+            # A declared-safe func keeps this bridge shareable: the only
+            # identity-keyed state InclusionNode.render has is its
+            # per-render template-resolution cache — deterministic,
+            # per-render lifetime, the same aliasing render_include's own
+            # setdefault(node, {}) relies on for shared functions.
             return self.visit_bridge(node)
         self.namespace[f"_node_{i}"] = node
         # context.new() below copies autoescape from the live context after

@@ -70,6 +70,34 @@ Compiling costs roughly 9x Django's parse per template, paid once per process. I
 
 Cache entries are keyed by a hash of the generated code, so stale entries are impossible by construction; corrupt or version-mismatched entries are silently recompiled. Point it only at a directory you trust — cached code is executed.
 
+### Declaring custom tags context-safe
+
+A custom tag without dedicated codegen renders through its own `render()` against the live context, which is always exact — but because the compiler can't see what that `render()` does, one such tag disables the read optimizations around it: the flattened read snapshot (template-wide), scope locals (in every enclosing `{% for %}`/`{% with %}`), and compiled-function sharing across template instances (which matters without a cached loader). `takes_context` simple/inclusion tags pay the first two as well.
+
+Most tags never write the context. If yours is one of them, declare it:
+
+```python
+class DivideNode(Node):
+    dtc_context_safe = True   # stock Django ignores this; dtc keeps its
+    ...                       # optimizations around the tag
+
+# takes_context tags declare the *function*:
+@register.simple_tag(takes_context=True)
+def current_section(context):
+    return context.get("section", "home")
+current_section.dtc_context_safe = True
+
+# third-party tags you can't edit, e.g. in settings or AppConfig.ready():
+import dtc
+dtc.declare_safe(SomeThirdPartyNode)
+```
+
+The declaration is a promise about every `render()` call: the context stack and its mappings are left exactly as found (balanced push/pop inside is fine); no state keyed on the node's identity (Django's `CycleNode`/`IfChangedNode` pattern); behavior depends only on the parsed source. *Reading* the context is always fine, as is setting `context.autoescape`. A container tag may render nested writers freely, provided every nodelist it renders is listed in the standard `child_nodelists` attribute — the compiler analyzes those children itself; a rendered-but-unlisted nodelist is the one thing that can silently break output. Subclasses inherit the declaration with the `render()` it describes (`dtc_context_safe = False` opts back out). See `help(dtc.declare_safe)` for the precise contract.
+
+A wrong declaration produces wrong output silently — so verify it: run your test suite with `DTC_CHECK_DECLARATIONS=1` and dtc checks every declared-safe render, raising `dtc.ContextSafeViolation` on a violation. (Containers wrapping legitimate writers are skipped by the checker; the source-determinism clause isn't mechanically checkable.)
+
+Tags that just compute a value from their arguments — like the division example above — are better rewritten as `@register.simple_tag`: those compile natively, declaration-free, with argument resolution inlined.
+
 ## Development
 
 ```bash

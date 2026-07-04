@@ -202,6 +202,86 @@ def render_extends(node, context):
         return render_body(compiled_parent, context)
 
 
+def _context_snapshot(context):
+    return [dict(d) for d in context.dicts]
+
+
+def _diff_layers(label, before, context):
+    """Raise ContextSafeViolation if any context layer changed, naming the
+    added/removed/changed keys in the first layer that did."""
+    from . import ContextSafeViolation
+
+    for i, (was, now) in enumerate(zip(before, context.dicts)):
+        now = dict(now)
+        if now == was:
+            continue
+        added = sorted(k for k in now if k not in was)
+        removed = sorted(k for k in was if k not in now)
+        changed = sorted(
+            k for k in now if k in was and now[k] is not was[k] and now[k] != was[k]
+        )
+        raise ContextSafeViolation(
+            f"{label} is declared dtc_context_safe but mutated context "
+            f"layer {i} (contract clause (a)): "
+            f"added={added!r} removed={removed!r} changed={changed!r}"
+        )
+
+
+def checked_safe_render(node, context):
+    """DTC_CHECK_DECLARATIONS bridge for a node declared
+    ``dtc_context_safe``: verifies contract clauses (a) — no net context
+    writes — and (b) — no state keyed by node identity — on every call.
+    Clause (c), source-determinism, is not mechanically checkable, nor is
+    an unlisted child nodelist (clause (d)). TagHelperNodes are exempt from
+    the identity check: their declaration rides on the tag function (only
+    clause (a) applies), and InclusionNode's own per-render template cache
+    is Django's blessed machinery."""
+    from . import ContextSafeViolation
+
+    label = f"{type(node).__module__}.{type(node).__qualname__}"
+    depth_before = len(context.dicts)
+    before = _context_snapshot(context)
+    result = node.render_annotated(context)
+    if len(context.dicts) != depth_before:
+        raise ContextSafeViolation(
+            f"{label} is declared dtc_context_safe but changed the context "
+            f"stack depth from {depth_before} to {len(context.dicts)} "
+            "(unbalanced push/pop violates contract clause (a))"
+        )
+    _diff_layers(label, before, context)
+    from django.template.library import TagHelperNode
+
+    if not isinstance(node, TagHelperNode) and any(
+        node in d for d in context.render_context.dicts
+    ):
+        raise ContextSafeViolation(
+            f"{label} is declared dtc_context_safe but keeps render_context "
+            "state keyed by its own identity (contract clause (b)); it must "
+            "not be declared safe"
+        )
+    return result
+
+
+def checked_safe_call(func, context, thunk):
+    """DTC_CHECK_DECLARATIONS wrapper for a ``takes_context`` tag function
+    declared ``dtc_context_safe``: verifies contract clause (a) around the
+    call built by the compiler (``thunk``)."""
+    from . import ContextSafeViolation
+
+    label = f"{func.__module__}.{func.__qualname__}"
+    depth_before = len(context.dicts)
+    before = _context_snapshot(context)
+    result = thunk()
+    if len(context.dicts) != depth_before:
+        raise ContextSafeViolation(
+            f"{label} is declared dtc_context_safe but changed the context "
+            f"stack depth from {depth_before} to {len(context.dicts)} "
+            "(unbalanced push/pop violates contract clause (a))"
+        )
+    _diff_layers(label, before, context)
+    return result
+
+
 def resolve_include(key, names, context):
     """First render-time use of a literal ``{% include %}`` site: resolve
     the target exactly as ``IncludeNode.render`` would (same engine, same

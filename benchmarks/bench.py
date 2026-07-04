@@ -100,6 +100,53 @@ def scenarios():
     )
 
 
+from django import template as _dj_template  # noqa: E402
+
+register = _dj_template.Library()
+
+
+class BenchCellNode(_dj_template.Node):
+    """A DivideNode-style third-party tag: reads two values, writes nothing."""
+
+    def __init__(self, var):
+        self.var = _dj_template.Variable(var)
+
+    def render(self, context):
+        row = self.var.resolve(context)
+        return f"{row.name}={row.price}"
+
+
+class BenchCellSafeNode(BenchCellNode):
+    dtc_context_safe = True
+
+
+@register.tag
+def bench_cell(parser, token):
+    return BenchCellNode(token.split_contents()[1])
+
+
+@register.tag
+def bench_cell_safe(parser, token):
+    return BenchCellSafeNode(token.split_contents()[1])
+
+
+def custom_tag_scenarios():
+    """The same read-only custom tag in a 100-row loop, bridged as an
+    opaque unknown vs declared dtc_context_safe: the declaration keeps the
+    flat snapshot, scope locals, and source-cache sharing."""
+    context = {
+        "rows": [Obj() for _ in range(100)],
+        "title": "Inventory",
+        "unit": "USD",
+    }
+    body = lambda tag: (
+        "{% for row in rows %}<li>{{ row.name }} {{ title }}/{{ unit }}: "
+        "{% " + tag + " row %}</li>{% endfor %}"
+    )
+    yield ("custom_tag (100 rows, bridged)", body("bench_cell"), context)
+    yield ("custom_tag (100 rows, declared safe)", body("bench_cell_safe"), context)
+
+
 INHERITANCE_TEMPLATES = {
     "bench_base.html": (
         "<html><head><title>{% block title %}t{% endblock %}</title></head>"
@@ -168,6 +215,30 @@ def main():
     for name, source, context in scenarios():
         dtc_template = dtc_backend.from_string(source)
         django_template = django_backend.from_string(source)
+        assert dtc_template._compiled is not None, f"{name} did not compile"
+        assert dtc_template.render(dict(context)) == django_template.render(
+            dict(context)
+        ), f"{name} output mismatch"
+        django_time = bench(django_template, context)
+        dtc_time = bench(dtc_template, context)
+        print(
+            f"{name:38} {django_time * 1e6:8.1f}us {dtc_time * 1e6:8.1f}us"
+            f" {django_time / dtc_time:8.2f}x"
+        )
+
+    # Custom-tag scenarios need this module as a tag library; when run as a
+    # script the module is importable as __main__.
+    tag_options = {
+        "NAME": "bench",
+        "DIRS": [],
+        "APP_DIRS": False,
+        "OPTIONS": {"builtins": [__name__]},
+    }
+    dtc_tags = DTCTemplates(dict(tag_options))
+    django_tags = DjangoTemplates(dict(tag_options))
+    for name, source, context in custom_tag_scenarios():
+        dtc_template = dtc_tags.from_string(source)
+        django_template = django_tags.from_string(source)
         assert dtc_template._compiled is not None, f"{name} did not compile"
         assert dtc_template.render(dict(context)) == django_template.render(
             dict(context)
