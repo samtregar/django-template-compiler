@@ -885,6 +885,86 @@ def test_scope_locals_disabled_by_opaque_bridge():
     assert template.render(base_context()) == "<poke>poked" * 3
 
 
+def test_takes_context_tag_rebinds_scope_names():
+    """A takes_context function receives the live context and can write
+    loop/with-bound names, exactly like an opaque bridged tag: scope
+    locals must be disabled around it."""
+    assert_identical_and_compiled(
+        "{% for x in items %}{% ctx_set 'x' 'changed' %}{{ x }}|{% endfor %}"
+    )
+    assert_identical_and_compiled(
+        "{% with y=name %}{% ctx_set 'y' 'changed' %}{{ y }}{% endwith %}"
+    )
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% for x in items %}{% ctx_set 'x' 'c' %}{{ x }}{% endfor %}"
+    )
+    assert "_lv" not in template._compiled.__dtc_source__
+
+
+def test_takes_context_inclusion_tag_reads_forloop():
+    """The inclusion *template* renders isolated, but the takes_context
+    function itself sees the live context — forloop must be maintained."""
+    templates = {
+        "inc_tag.html": "<card>{{ label }}={{ value }}</card>",
+        "main.html": "{% for x in items %}{% card_forloop %}{% endfor %}",
+    }
+    render_named_both(templates, "main.html")
+
+
+def test_autoescape_mutation_by_takes_context_simple_tag():
+    """Stock SimpleNode.render reads context.autoescape *after* calling
+    the function: a tag that flips it changes its own output's escaping
+    and everything after it."""
+    assert_identical_and_compiled("{% ctx_autoescape_off %}{{ html }}")
+    assert_identical_and_compiled("{% ctx_autoescape_off as t %}{{ t }}{{ html }}")
+
+
+def test_autoescape_mutation_by_takes_context_inclusion_tag():
+    templates = {
+        "inc_tag.html": "<card>{{ label }}={{ value }}</card>",
+        "main.html": "{% card_autoescape_off %}{{ html }}",
+    }
+    render_named_both(templates, "main.html")
+
+
+def test_autoescape_mutation_by_bridged_node():
+    assert_identical_and_compiled("{% aoff %}{{ html }}")
+    assert_identical_and_compiled(
+        "{% autoescape off %}x{% endautoescape %}{% aoff %}{{ html }}"
+    )
+    # Inside {% autoescape %}: the wrapper's restore still wins afterwards.
+    assert_identical_and_compiled(
+        "{% autoescape off %}{% aoff %}{{ html }}{% endautoescape %}{{ html }}"
+    )
+    assert_identical_and_compiled(
+        "{% for x in items %}{% aoff %}{{ x }}{% endfor %}{{ html }}"
+    )
+
+
+AUTOESCAPE_LEAK_TEMPLATES = {
+    "aoff.html": "{% aoff %}",
+    "main_inc.html": "{% include 'aoff.html' %}{{ html }}",
+    # Isolated include mutates a context.new() copy: must NOT leak.
+    "main_inc_only.html": "{% include 'aoff.html' only %}{{ html }}",
+    "main_block.html": "{% block b %}{% aoff %}{% endblock %}{{ html }}",
+    "aoff_base.html": "{% block b %}{% aoff %}{% endblock %}{{ html }}",
+    "aoff_child.html": (
+        "{% extends 'aoff_base.html' %}"
+        "{% block b %}[{{ block.super }}]{{ html }}{% endblock %}"
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "name", ["main_inc.html", "main_inc_only.html", "main_block.html", "aoff_child.html"]
+)
+def test_autoescape_mutation_leaks_like_stock(name):
+    """Blocks, non-isolated includes, and {{ block.super }} all run foreign
+    code against the live context; the hoisted autoescape local must track
+    whatever they did — and must NOT see mutations stock wouldn't."""
+    render_named_both(AUTOESCAPE_LEAK_TEMPLATES, name)
+
+
 def test_int_fast_path_respects_thousand_separator():
     from django.test import override_settings
 

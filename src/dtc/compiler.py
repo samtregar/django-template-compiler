@@ -404,14 +404,14 @@ class _Analysis:
                 self.walk(node.nodelist, in_loop)
             elif node_type in (SimpleNode, InclusionNode):
                 # Arguments resolve in the outer context; a takes_context
-                # function can read anything. (InclusionNode renders its
-                # template with context.new() — isolated — so the template
-                # itself can't see forloop.)
+                # function can read anything — including context['forloop'],
+                # even for InclusionNode, whose *template* renders isolated
+                # (context.new()) but whose function gets the live context.
                 for fe in list(node.args) + list(node.kwargs.values()):
                     self._fe(fe)
                 if node.takes_context:
                     self.mutation_opaque = True
-                    if node_type is SimpleNode and in_loop:
+                    if in_loop:
                         self.force_forloop = True
             else:
                 # Unknown node: bridged at codegen. Its render can read
@@ -514,9 +514,19 @@ else:
 {output}\
 """
 
+# The hoisted _autoescape local must be re-read after any code that Django
+# hands the live context to: bridged node renders, slow-path replays through
+# original nodes ({{ block.super }} renders the parent block against the live
+# context), takes_context tag functions, and the block/include mirrors — any
+# of them may set context.autoescape, which stock rendering reads live.
+# Values reached through Variable.resolve in conditions and filter arguments
+# are excluded: Django never passes those callables the context.
+_RESYNC_AUTOESCAPE = "_autoescape = context.autoescape\n"
+
 _SLOW_OR_ELSE = """\
 if _value is _SLOW:
     _append(_node_{i}.render(context))
+    _autoescape = context.autoescape
 else:
 {body}\
 """
@@ -695,7 +705,7 @@ class _Codegen:
         # function specific to this parse: it must not be shared across
         # same-source template instances (see runtime.compiled_for).
         self.uses_bridges = True
-        return f"_append(_node_{i}.render_annotated(context))\n"
+        return f"_append(_node_{i}.render_annotated(context))\n" + _RESYNC_AUTOESCAPE
 
     # --- leaves ---------------------------------------------------------
 
@@ -747,7 +757,7 @@ class _Codegen:
             # translate flag, or odd parses (e.g. constant that resolved
             # to None): the original node.
             self.namespace[f"_node_{i}"] = node
-            return f"_append(_node_{i}.render(context))\n"
+            return f"_append(_node_{i}.render(context))\n" + _RESYNC_AUTOESCAPE
 
         if fe.filters:
             filters = "".join(
@@ -767,10 +777,12 @@ class _Codegen:
 
     def _scope_safe(self, nodelist):
         """A scope may bind names to locals only if its body contains no
-        opaque bridged node: an unknown tag can rebind any context name
-        behind our back ({% regroup ... as x %}), and a stale local would
-        diverge. All dedicated-codegen nodes either don't write the outer
-        scope or (simple_tag target_var) are handled explicitly."""
+        node that can write context names behind our back: an unknown
+        bridged tag can rebind anything ({% regroup ... as x %}), and so
+        can a takes_context function — it receives the live context even
+        though the node around it compiles natively. A stale local would
+        diverge. All other dedicated-codegen nodes either don't write the
+        outer scope or (simple_tag target_var) are handled explicitly."""
         return not self._has_opaque(nodelist)
 
     def _has_opaque(self, nodelist):
@@ -779,7 +791,11 @@ class _Codegen:
             return cached
         result = False
         for node in nodelist:
-            if type(node) not in self._handlers:
+            node_type = type(node)
+            if node_type not in self._handlers:
+                result = True
+                break
+            if node_type in (SimpleNode, InclusionNode) and node.takes_context:
                 result = True
                 break
             for attr in getattr(node, "child_nodelists", ()):
@@ -1118,7 +1134,9 @@ class _Codegen:
         i = self.uid()
         self.namespace[f"_node_{i}"] = node
         self._compile_block_body(node)
-        return f"_append(_render_block(_node_{i}, context))\n"
+        # The block site may render an override (or, via block.super, an
+        # ancestor body) containing autoescape-mutating foreign code.
+        return f"_append(_render_block(_node_{i}, context))\n" + _RESYNC_AUTOESCAPE
 
     def visit_extends(self, node):
         # The extends machinery (parent resolution, BlockContext population)
@@ -1151,7 +1169,11 @@ class _Codegen:
                 name = None
             if name is not None:
                 return self._literal_include(node, i, (name,))
-        return f"_append(_render_include(_node_{i}, context))\n"
+        # A non-isolated include renders against this very context object:
+        # anything inside it may flip autoescape, and stock's later reads
+        # would see that. (Isolated includes mutate a context.new() copy;
+        # the resync then re-reads an unchanged value — still exact.)
+        return f"_append(_render_include(_node_{i}, context))\n" + _RESYNC_AUTOESCAPE
 
     def _literal_include(self, node, i, names):
         # The cache key is per include site per compiled function; stock
@@ -1175,7 +1197,7 @@ class _Codegen:
                 + _indented(_INCLUDE_PUSH_STATE.format(i=i, ctx="context"))
                 + "finally:\n    context.pop()\n"
             )
-        return _INCLUDE_LITERAL.format(i=i, body=_indented(body))
+        return _INCLUDE_LITERAL.format(i=i, body=_indented(body)) + _RESYNC_AUTOESCAPE
 
     def _compile_block_body(self, node):
         """node.blocks of an ExtendsNode includes nested blocks, and
@@ -1241,10 +1263,14 @@ class _Codegen:
         target_var/autoescape branches decided now."""
         i = self.uid()
         call = self._tag_call(node, i)
+        # Stock reads context.autoescape *after* the call; a takes_context
+        # function may have flipped it.
+        resync = _RESYNC_AUTOESCAPE if node.takes_context else ""
         if node.target_var is not None:
             block = (
                 f"_tag_value = {call}\n"
-                f"context[{node.target_var!r}] = _tag_value\n"
+                + resync
+                + f"context[{node.target_var!r}] = _tag_value\n"
             )
             local = self.scope.get(node.target_var)
             if local is not None:
@@ -1253,7 +1279,8 @@ class _Codegen:
             return block
         return (
             f"_value = {call}\n"
-            "if _autoescape:\n"
+            + resync
+            + "if _autoescape:\n"
             "    _value = _conditional_escape(_value)\n"
             "_append(_value)\n"
         )
@@ -1277,9 +1304,14 @@ class _Codegen:
         else:
             return self.visit_bridge(node)
         self.namespace[f"_node_{i}"] = node
+        # context.new() below copies autoescape from the live context after
+        # the call, as stock does — but the hoisted local needs a resync
+        # when a takes_context function may have flipped it.
+        resync = _RESYNC_AUTOESCAPE if node.takes_context else ""
         return (
             f"_incl_dict = {self._tag_call(node, i)}\n"
-            f"_incl_t = context.render_context.get(_node_{i})\n"
+            + resync
+            + f"_incl_t = context.render_context.get(_node_{i})\n"
             "if _incl_t is None:\n"
             + resolve
             + f"    context.render_context[_node_{i}] = _incl_t\n"

@@ -52,6 +52,18 @@ def ctx_reader(context, key):
     return f"[{context.get(key, 'absent')}]"
 
 
+@register.simple_tag(takes_context=True)
+def ctx_set(context, key, value):
+    context[key] = value
+    return ""
+
+
+@register.simple_tag(takes_context=True)
+def ctx_autoescape_off(context):
+    context.autoescape = False
+    return "<tag>"
+
+
 @register.simple_tag
 def kw_any(**kwargs):
     return ";".join(f"{k}={v}" for k, v in sorted(kwargs.items()))
@@ -65,6 +77,18 @@ def card(label, value="?"):
 @register.inclusion_tag("inc_tag.html", takes_context=True)
 def card_ctx(context):
     return {"label": "from-ctx", "value": context.get("name", "?")}
+
+
+@register.inclusion_tag("inc_tag.html", takes_context=True)
+def card_autoescape_off(context):
+    context.autoescape = False
+    return {"label": "<l>", "value": "v"}
+
+
+@register.inclusion_tag("inc_tag.html", takes_context=True)
+def card_forloop(context):
+    forloop = context.get("forloop") or {}
+    return {"label": "loop", "value": forloop.get("counter", "?")}
 
 
 class ContextPokeNode(template.Node):
@@ -81,6 +105,19 @@ class ContextPokeNode(template.Node):
 @register.tag
 def poke(parser, token):
     return ContextPokeNode(token.split_contents()[1])
+
+
+class AutoescapeOffNode(template.Node):
+    """A raw third-party-style node: flips the live context's autoescape."""
+
+    def render(self, context):
+        context.autoescape = False
+        return "<aoff>"
+
+
+@register.tag
+def aoff(parser, token):
+    return AutoescapeOffNode()
 
 
 def make_backend(cls, **options):
