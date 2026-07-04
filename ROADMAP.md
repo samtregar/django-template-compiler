@@ -139,8 +139,8 @@ lookup fast path bails on callables and replays through Django's machinery.
   fresh template instances and dtc recompiled each one (3x *slower* than
   stock). Fixed with a per-(engine, name, source) compile cache.
 - Measured: include-heavy inheritance ~1.15x, bounded by Django's
-  per-include protocol, which we reproduce (literal-include inlining
-  remains a candidate).
+  per-include protocol, which we reproduce (later addressed by the
+  phase-8 literal-include fast path).
 
 ## Phase 5 — The bridge: per-node fallback ✅
 
@@ -239,6 +239,26 @@ of the always-live context rather than instead of it:
   closes about half the gap to Jinja2 while staying byte-identical to
   Django — the rest is the price of Django's semantics, which Jinja2
   dropped and we keep.
+- **Literal-include fast path** (the "literal-include inlining" candidate,
+  built as call specialization rather than AST splicing): a
+  `{% include "name" %}` site folds `construct_relative_path` at compile
+  time, resolves the target and its compiled body once per top-level
+  render (cached on `render_context` — the same lifetime as
+  `IncludeNode.render`'s own per-node cache, so loader reload behavior
+  matches stock exactly, cached loader or not), then reproduces
+  `IncludeNode.render` inline per call: real `context.push()`/`new()`,
+  real inlined `render_context.push_state`, direct call of the target's
+  compiled function. A patched `Template._render` or uncompiled target
+  routes through the runtime mirror per call; autopatch's stats-only
+  `_render` registers itself in `runtime._transparent_renders` so the
+  oracle suite exercises the fast path rather than always falling back.
+  AST splicing was rejected deliberately: the per-include `push_state`
+  frame and `context.push` are observable (ifchanged/cycle state frames,
+  BlockContext isolation), so inlining could remove only the call
+  overhead, not the protocol. Bonus from the same analysis: isolated
+  (`only`) includes no longer force forloop maintenance in enclosing
+  loops — `context.new()` provably hides it. inheritance scenario
+  (extends + include in loop): 1.15x → **1.59x**.
 
-**Remaining for 0.1.0:** literal-include inlining (optimization,
-optional), trial against a real application's templates, release.
+**Remaining for 0.1.0:** trial against a real application's templates,
+release.

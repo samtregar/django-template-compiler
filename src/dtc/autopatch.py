@@ -18,6 +18,7 @@ Experimental; the supported integration point is ``dtc.backend.DTCTemplates``.
 
 from __future__ import annotations
 
+from . import runtime
 from .runtime import compiled_for, stats
 
 _installed = False
@@ -44,6 +45,11 @@ def install():
         return compiled(context)
 
     Template._render = _render
+    # This replacement is compiled-aware (it only adds stats counting), so
+    # the literal-include fast path may route around it. The
+    # instrumented_test_render below must NOT be registered: it sends the
+    # template_rendered signal, which routing around would silence.
+    runtime._transparent_renders.append(_render)
 
     def instrumented_test_render(self, context):
         # Byte-for-byte what django.test.utils.instrumented_test_render does,

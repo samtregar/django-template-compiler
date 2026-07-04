@@ -445,6 +445,31 @@ INHERITANCE_TEMPLATES = {
     "main_inc_only.html": "{% include 'inc.html' with extra=name only %}",
     "main_inc_var.html": "{% include which %}",
     "main_inc_loop.html": "{% for x in items %}{% include 'inc_forloop.html' %}{% endfor %}",
+    "main_inc_rel.html": "{% include './inc.html' with extra='rel' %}",
+    "inc_chain_mid.html": "mid[{% include 'inc.html' %}]",
+    "main_inc_chain.html": "chain{% include 'inc_chain_mid.html' %}",
+    "inc_extends.html": (
+        "{% extends 'base.html' %}{% block content %}included-child:{{ name }}{% endblock %}"
+    ),
+    "main_inc_extends.html": "[{% include 'inc_extends.html' %}]",
+    "main_inc_only_loop.html": (
+        # only + forloop via extra_context: the isolated body can't see the
+        # loop, but the value resolved outside it can.
+        "{% for x in items %}{% include 'inc.html' with extra=forloop.counter only %}{% endfor %}"
+    ),
+    "main_inc_only_noforloop.html": (
+        # Isolated include in a loop: the target's forloop reads resolve
+        # against the new context (empty), so the loop may elide forloop.
+        "{% for x in items %}{% include 'inc_forloop.html' only %}{% endfor %}"
+    ),
+    "tree.html": (
+        # Recursive literal include, terminated by the data.
+        "{{ node.val }}{% if node.child %}[{% include 'tree.html' with node=node.child only %}]{% endif %}"
+    ),
+    "main_inc_autoescape.html": (
+        "{% autoescape off %}{% include 'inc.html' with extra=html %}{% endautoescape %}"
+        "{% include 'inc.html' with extra=html %}"
+    ),
 }
 
 
@@ -464,6 +489,12 @@ INHERITANCE_TEMPLATES = {
         "main_inc_with.html",
         "main_inc_only.html",
         "main_inc_loop.html",
+        "main_inc_rel.html",
+        "main_inc_chain.html",
+        "main_inc_extends.html",
+        "main_inc_only_loop.html",
+        "main_inc_only_noforloop.html",
+        "main_inc_autoescape.html",
         "main_cards.html",
     ],
 )
@@ -499,7 +530,82 @@ def test_include_missing_template():
             template.render(base_context())
 
 
-def test_forloop_forced_by_block_in_loop():
+def test_literal_include_takes_fast_path():
+    """A literal name compiles to the specialized include site; a variable
+    name keeps the generic runtime mirror."""
+    options = {
+        "loaders": [("django.template.loaders.locmem.Loader", INHERITANCE_TEMPLATES)]
+    }
+    backend = make_backend(DTCTemplates, **options)
+    literal = backend.get_template("main_inc.html")
+    assert "_resolve_include(" in literal._compiled.__dtc_source__
+    variable = backend.get_template("main_inc_var.html")
+    assert "_resolve_include(" not in variable._compiled.__dtc_source__
+
+
+def test_isolated_include_in_loop_elides_forloop():
+    """{% include ... only %} renders against context.new(), which provably
+    can't see forloop — the loop skips forloop maintenance. (The target of
+    main_inc_only_noforloop.html *does* reference forloop; the differential
+    case above proves it resolves empty under both engines.)"""
+    options = {
+        "loaders": [("django.template.loaders.locmem.Loader", INHERITANCE_TEMPLATES)]
+    }
+    backend = make_backend(DTCTemplates, **options)
+    elided = backend.get_template("main_inc_only_noforloop.html")
+    assert "'parentloop'" not in elided._compiled.__dtc_source__
+    # extra_context values resolve in the outer context: forloop stays.
+    kept = backend.get_template("main_inc_only_loop.html")
+    assert "'parentloop'" in kept._compiled.__dtc_source__
+    # Non-isolated includes keep forcing forloop: the target sees the
+    # outer context, and IfChangedNode state lives on the forloop dict.
+    kept = backend.get_template("main_inc_loop.html")
+    assert "'parentloop'" in kept._compiled.__dtc_source__
+
+
+def test_differential_recursive_include():
+    context = dict(
+        base_context(),
+        node={"val": "a", "child": {"val": "b", "child": {"val": "c", "child": None}}},
+    )
+    template, out = render_named_both(INHERITANCE_TEMPLATES, "tree.html", context)
+    assert template._compiled is not None
+    assert out == "a[b[c]]"
+
+
+def test_literal_include_honors_patched_render(monkeypatch):
+    """A Template._render patch installed at render time (test
+    instrumentation, third-party hooks) must route the include through the
+    patched machinery, not around it."""
+    from django.template.base import Template as BaseTemplate
+    from django.template.context import make_context
+
+    options = {
+        "loaders": [("django.template.loaders.locmem.Loader", INHERITANCE_TEMPLATES)]
+    }
+    backend = make_backend(DTCTemplates, **options)
+    template = backend.get_template("main_inc.html")
+    expected = make_backend(DjangoTemplates, **options).get_template(
+        "main_inc.html"
+    ).render(base_context())
+
+    rendered = []
+    original = BaseTemplate._render
+
+    def instrumented(self, context):
+        rendered.append(self.origin.template_name)
+        return original(self, context)
+
+    monkeypatch.setattr(BaseTemplate, "_render", instrumented)
+    # Drive the compiled function directly (the top-level entry points
+    # would themselves detect the patch and fall back before reaching it).
+    base = template.template
+    context = make_context(base_context(), autoescape=True)
+    with context.render_context.push_state(base):
+        with context.bind_template(base):
+            out = template._compiled(context)
+    assert out == expected
+    assert "inc.html" in rendered  # the target rendered through the patch
     """base_loop's own body never references forloop, but a child override
     can — a block inside a loop must force forloop maintenance."""
     options = {

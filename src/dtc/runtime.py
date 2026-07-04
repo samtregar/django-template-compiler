@@ -50,6 +50,15 @@ stats = {
 # route through the patched machinery instead of around it.
 _pristine_render = Template._render
 
+# Render functions the compiled include fast path may route around without
+# losing behavior: Django's own _render, plus autopatch's replacement (it
+# only adds stats counting; install() appends it here). The substituted
+# instrumented_test_render is deliberately NOT in this list — it sends the
+# template_rendered signal, which must keep firing per included template.
+# A list, not a tuple: compiled functions capture the object itself, so
+# autopatch installing after templates have compiled is still seen.
+_transparent_renders = [_pristine_render]
+
 
 def _render_is_patched(template):
     return type(template)._render is not _pristine_render
@@ -191,6 +200,21 @@ def render_extends(node, context):
 
     with context.render_context.push_state(compiled_parent, isolated_context=False):
         return render_body(compiled_parent, context)
+
+
+def resolve_include(key, names, context):
+    """First render-time use of a literal ``{% include %}`` site: resolve
+    the target exactly as ``IncludeNode.render`` would (same engine, same
+    ``select_template`` call) and pair it with its compiled body. The pair
+    is cached on ``render_context`` under the site's *key* for the rest of
+    this render — the same lifetime as ``IncludeNode.render``'s own
+    per-node cache — so template reloading behaves identically to stock
+    under any loader, cached or not. A failed lookup is not cached: like
+    stock, every render retries and raises ``TemplateDoesNotExist``."""
+    template = context.template.engine.select_template(names)
+    pair = (template, compiled_for(template))
+    context.render_context.dicts[0][key] = pair
+    return pair
 
 
 def render_include(node, context):

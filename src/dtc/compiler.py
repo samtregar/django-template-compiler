@@ -84,7 +84,12 @@ from django.templatetags.l10n import LocalizeNode
 from django.templatetags.tz import LocalTimeNode, TimezoneNode
 from django.template.base import Template as BaseTemplate
 from django.template.library import InclusionNode, SimpleNode
-from django.template.loader_tags import BlockNode, ExtendsNode, IncludeNode
+from django.template.loader_tags import (
+    BlockNode,
+    ExtendsNode,
+    IncludeNode,
+    construct_relative_path,
+)
 from django.utils import timezone as dj_timezone
 from django.utils import translation
 from django.utils.html import conditional_escape, escape, strip_spaces_between_tags
@@ -366,7 +371,15 @@ class _Analysis:
                     self.force_forloop = True
                 self.walk(node.nodelist, in_loop)
             elif node_type is IncludeNode:
-                if in_loop:
+                # The template FE and extra_context values resolve in the
+                # outer context; the included template itself sees the outer
+                # context too — unless isolated ({% include ... only %}),
+                # which renders against context.new() and so provably cannot
+                # read forloop.
+                self._fe(node.template)
+                for fe in node.extra_context.values():
+                    self._fe(fe)
+                if in_loop and not node.isolated_context:
                     self.force_forloop = True
             elif node_type is SpacelessNode:
                 self.walk(node.nodelist, in_loop)
@@ -550,6 +563,41 @@ finally:
     context.pop()
 """
 
+# Literal {% include %}: the target and its compiled body resolve once per
+# top-level render (cached on render_context — the same lifetime as
+# IncludeNode.render's own per-node cache, so loader behavior, cached or
+# not, matches stock); every call after that reproduces IncludeNode.render
+# inline and calls the compiled body directly. The patched-_render check
+# runs per call like template_render's, against runtime._transparent_renders
+# (pristine _render plus autopatch's stats-only replacement); a patched
+# target or an uncompiled one (debug engine, fail-open error) routes
+# through the full runtime mirror instead.
+_INCLUDE_LITERAL = """\
+_incl_pair_{i} = context.render_context.dicts[0].get(_incl_key_{i})
+if _incl_pair_{i} is None:
+    _incl_pair_{i} = _resolve_include(_incl_key_{i}, _incl_names_{i}, context)
+_incl_t_{i}, _incl_fn_{i} = _incl_pair_{i}
+if _incl_fn_{i} is None or type(_incl_t_{i})._render not in _transparent_renders:
+    _append(_render_include(_node_{i}, context))
+else:
+{body}\
+"""
+
+# render_context.push_state(target), inlined — its isolated_context=True
+# form, the one Template._render/template_render uses: swap .template,
+# push a fresh state frame, restore both in a finally.
+_INCLUDE_PUSH_STATE = """\
+_rc_{i} = context.render_context
+_rcsaved_{i} = _rc_{i}.template
+_rc_{i}.template = _incl_t_{i}
+_rc_{i}.push()
+try:
+    _append(_incl_fn_{i}({ctx}))
+finally:
+    _rc_{i}.template = _rcsaved_{i}
+    _rc_{i}.pop()
+"""
+
 _FORLOOP_UPDATE = """\
 _forloop_{i}['counter0'] = _index_{i}
 _forloop_{i}['counter'] = _index_{i} + 1
@@ -588,6 +636,8 @@ class _Codegen:
             "_render_block": runtime.render_block,
             "_render_extends": runtime.render_extends,
             "_render_include": runtime.render_include,
+            "_resolve_include": runtime.resolve_include,
+            "_transparent_renders": runtime._transparent_renders,
             "_template_render": runtime.template_render,
             "_conditional_escape": conditional_escape,
             "_settings": settings,
@@ -1083,7 +1133,49 @@ class _Codegen:
     def visit_include(self, node):
         i = self.uid()
         self.namespace[f"_node_{i}"] = node
+        fe = node.template
+        # Literal path ({% include "name" %}): the parser resolved the name
+        # to a plain string constant, so construct_relative_path's result —
+        # what IncludeNode.render feeds select_template — is a compile-time
+        # constant too. (The empty string is excluded: stock treats it as
+        # "no names provided", a different select_template call.)
+        if not fe.filters and isinstance(fe.var, str) and fe.var:
+            try:
+                name = construct_relative_path(
+                    node.origin.template_name, fe.var
+                )
+            except Exception:
+                # Whatever the render-time call would raise (e.g. a
+                # relative name that escapes or self-references) must keep
+                # raising per render, through the mirror.
+                name = None
+            if name is not None:
+                return self._literal_include(node, i, (name,))
         return f"_append(_render_include(_node_{i}, context))\n"
+
+    def _literal_include(self, node, i, names):
+        # The cache key is per include site per compiled function; stock
+        # keys the same cache by node identity, which a shared function
+        # embeds anyway (_node_{i}), so the aliasing behavior is unchanged.
+        self.namespace[f"_incl_key_{i}"] = object()
+        self.namespace[f"_incl_names_{i}"] = names
+        values = ", ".join(
+            f"{key!r}: {self._arg_expr(fe, f'_incl_arg_{i}_{k}')}"
+            for k, (key, fe) in enumerate(node.extra_context.items())
+        )
+        if node.isolated_context:
+            body = f"_ictx_{i} = context.new({{{values}}})\n" + (
+                _INCLUDE_PUSH_STATE.format(i=i, ctx=f"_ictx_{i}")
+            )
+        else:
+            push = f"context.push({{{values}}})\n" if values else "context.push()\n"
+            body = (
+                push
+                + "try:\n"
+                + _indented(_INCLUDE_PUSH_STATE.format(i=i, ctx="context"))
+                + "finally:\n    context.pop()\n"
+            )
+        return _INCLUDE_LITERAL.format(i=i, body=_indented(body))
 
     def _compile_block_body(self, node):
         """node.blocks of an ExtendsNode includes nested blocks, and

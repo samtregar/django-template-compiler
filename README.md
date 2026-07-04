@@ -25,7 +25,7 @@ Templates are parsed with Django's own lexer and parser, then compiled to Python
 | 50×4 table (nested loop + if) | 516.3 | 271.9 | 1.9x |
 | with/if scopes | 206.8 | 91.2 | 2.3x |
 | spaceless-wrapped table | 248.2 | 114.6 | 2.2x |
-| inheritance + include in loop | 153.6 | 135.0 | 1.1x |
+| inheritance + include in loop | 151.4 | 93.5 | 1.6x |
 | bridged unknown tag (worst case) | 26.3 | 21.0 | 1.3x |
 
 For reference, Jinja2 renders the table scenario in ~80µs — dtc closes about half the gap to Jinja2 while producing byte-identical Django output. The remaining distance is the price of Django's semantics themselves (silent variable failures, callable auto-invocation, the context stack), which dtc preserves exactly and Jinja2 deliberately dropped.
