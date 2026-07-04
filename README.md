@@ -94,7 +94,28 @@ dtc.declare_safe(SomeThirdPartyNode)
 
 The declaration is a promise about every `render()` call: the context stack and its mappings are left exactly as found (balanced push/pop inside is fine); no state keyed on the node's identity (Django's `CycleNode`/`IfChangedNode` pattern); behavior depends only on the parsed source. *Reading* the context is always fine, as is setting `context.autoescape`. A container tag may render nested writers freely, provided every nodelist it renders is listed in the standard `child_nodelists` attribute — the compiler analyzes those children itself; a rendered-but-unlisted nodelist is the one thing that can silently break output. Subclasses inherit the declaration with the `render()` it describes (`dtc_context_safe = False` opts back out). See `help(dtc.declare_safe)` for the precise contract.
 
-A wrong declaration produces wrong output silently — so verify it: run your test suite with `DTC_CHECK_DECLARATIONS=1` and dtc checks every declared-safe render, raising `dtc.ContextSafeViolation` on a violation. (Containers wrapping legitimate writers are skipped by the checker; the source-determinism clause isn't mechanically checkable.)
+Tags that *do* write the context can declare **what** they write instead, as long as the target names are fixed at parse time — the common capture/setter shape:
+
+```python
+class StoreNode(Node):
+    # names the instance attributes holding the written context keys
+    dtc_context_writes = ("save_to",)
+
+    def __init__(self, nodelist, save_to):
+        self.nodelist = nodelist
+        self.save_to = save_to          # {% store as NAME %}...{% endstore %}
+
+    def render(self, context):
+        context[self.save_to] = self.nodelist.render(context)
+        return ""
+
+# or for classes you can't edit:
+dtc.declare_writes(SomeCaptureNode, "save_to")
+```
+
+The compiler routes reads of the declared names through the live context and keeps every optimization on for everything else — including scope locals: if a declared write shadows a `{% for %}`/`{% with %}` name, the generated code re-reads that local right after the tag runs. The rest of the contract matches `dtc_context_safe`; the declared keys may be *set* only (no deletions), and an attribute holding `None` means an optional target unused at that site. See `help(dtc.declare_writes)`.
+
+A wrong declaration produces wrong output silently — so verify it: run your test suite with `DTC_CHECK_DECLARATIONS=1` and dtc checks every declared render, raising `dtc.ContextSafeViolation` on any write outside the declaration. (Containers wrapping legitimate writers are skipped by the checker; the source-determinism clause isn't mechanically checkable.)
 
 Tags that just compute a value from their arguments — like the division example above — are better rewritten as `@register.simple_tag`: those compile natively, declaration-free, with argument resolution inlined.
 

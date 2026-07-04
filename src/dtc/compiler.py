@@ -220,6 +220,33 @@ def _is_declared_safe(node):
     return bool(getattr(node_type, "dtc_context_safe", False))
 
 
+def _declared_writes(node):
+    """The context keys a declared bridged node's render() may write, as a
+    frozenset — or None when the node carries no declaration and must stay
+    opaque. ``dtc_context_writes`` (raw nodes only; see
+    ``dtc.declare_writes``) names the *instance attributes* holding the
+    written key names, since targets like ``{% store ... as x %}`` are
+    parse-time data; ``dtc_context_safe`` is the writes-nothing case. An
+    attribute holding None means the optional target is unused at this
+    site; anything else non-string makes the declaration unusable and the
+    node stays opaque."""
+    node_type = type(node)
+    if node_type in (SimpleNode, InclusionNode):
+        return frozenset() if _is_declared_safe(node) else None
+    attrs = getattr(node_type, "dtc_context_writes", None)
+    if attrs is not None:
+        names = set()
+        for attr in attrs:
+            name = getattr(node, attr, None)
+            if name is None:
+                continue
+            if not isinstance(name, str):
+                return None
+            names.add(name)
+        return frozenset(names)
+    return frozenset() if _is_declared_safe(node) else None
+
+
 # Names a unit's own code writes into the context. Reads of these must use
 # the context walk (or a scope local); reads of anything else may use the
 # flattened snapshot — nothing in a flatten-safe template can change them.
@@ -261,9 +288,12 @@ def _collect_writes(nodelist, out):
             # but still write the live context (simple_tag target_var,
             # nested {% for %}/{% with %}, ...), so their writes must poison
             # the flat snapshot. Over-collection only disables optimization;
-            # without a safe declaration mutation_opaque already disables
+            # without a declaration mutation_opaque already disables
             # flattening, making the extra names inert. The handlers guard
             # keeps BlockNode/ExtendsNode excluded (next comment).
+            writes = _declared_writes(node)
+            if writes:
+                out.update(writes)
             for attr in getattr(node, "child_nodelists", ()):
                 child = getattr(node, attr, None)
                 if child is not None:
@@ -458,16 +488,17 @@ class _Analysis:
                 # Unknown node: bridged at codegen. Its render can read
                 # (or write) anything on the live context.
                 if in_loop:
-                    # Even a declared-safe node may resolve forloop.counter;
-                    # v1 of the declaration doesn't enumerate reads.
+                    # Even a declared node may resolve forloop.counter;
+                    # the declarations don't enumerate reads.
                     self.force_forloop = True
-                if _is_declared_safe(node):
-                    # Declared context-safe: no net writes of its own, so
-                    # the flat snapshot survives — but children (rendered
-                    # interpreted inside the bridge) speak for themselves:
-                    # a nested unknown tag or takes_context function must
-                    # still set mutation_opaque, and their reads belong in
-                    # first_bits.
+                if _declared_writes(node) is not None:
+                    # Declared (dtc_context_safe / dtc_context_writes): its
+                    # own writes are none or enumerated (joining the unit's
+                    # written set), so the flat snapshot survives — but
+                    # children (rendered interpreted inside the bridge)
+                    # speak for themselves: a nested unknown tag or
+                    # takes_context function must still set
+                    # mutation_opaque, and their reads belong in first_bits.
                     for attr in getattr(node, "child_nodelists", ()):
                         child = getattr(node, attr, None)
                         if child is not None:
@@ -757,24 +788,39 @@ class _Codegen:
         plain passthrough to render, matching NodeList.render."""
         i = self.uid()
         self.namespace[f"_node_{i}"] = node
-        if _is_declared_safe(node):
-            # Declared context-safe (dtc.declare_safe): contract clauses
-            # (b) no identity-keyed state and (c) same-source instances
-            # interchangeable make embedding this parse's node in a shared
-            # function exact, so this bridge does not forfeit
-            # __dtc_shareable__.
+        writes = _declared_writes(node)
+        if writes is not None:
+            # Declared (dtc.declare_safe / dtc.declare_writes): contract
+            # clauses (b) no identity-keyed state and (c) same-source
+            # instances interchangeable make embedding this parse's node in
+            # a shared function exact, so this bridge does not forfeit
+            # __dtc_shareable__. A declared write may rebind a scope-local
+            # name behind the local: resync those locals from the live
+            # context right after the bridge (the same keep-in-sync move
+            # visit_simple makes for target_var).
+            resync = "".join(
+                f"{local} = _context_get({name!r})\n"
+                for name, local in sorted(self.scope.items())
+                if name in writes
+            )
             if _checking_declarations() and self._bridge_checkable(node):
-                return (
-                    f"_append(_checked_safe_render(_node_{i}, context))\n"
-                    + _RESYNC_AUTOESCAPE
-                )
-        else:
-            # Bridged nodes may keep per-node state keyed by their own
-            # identity (IfChangedNode, CycleNode, ...). Embedding one makes
-            # this compiled function specific to this parse: it must not be
-            # shared across same-source template instances (see
-            # runtime.compiled_for).
-            self.uses_bridges = True
+                if writes:
+                    self.namespace[f"_writes_{i}"] = writes
+                    call = f"_checked_safe_render(_node_{i}, context, _writes_{i})"
+                else:
+                    call = f"_checked_safe_render(_node_{i}, context)"
+                return f"_append({call})\n" + resync + _RESYNC_AUTOESCAPE
+            return (
+                f"_append(_node_{i}.render_annotated(context))\n"
+                + resync
+                + _RESYNC_AUTOESCAPE
+            )
+        # Bridged nodes may keep per-node state keyed by their own
+        # identity (IfChangedNode, CycleNode, ...). Embedding one makes
+        # this compiled function specific to this parse: it must not be
+        # shared across same-source template instances (see
+        # runtime.compiled_for).
+        self.uses_bridges = True
         return f"_append(_node_{i}.render_annotated(context))\n" + _RESYNC_AUTOESCAPE
 
     def _bridge_checkable(self, node):
@@ -879,14 +925,17 @@ class _Codegen:
         result = False
         for node in nodelist:
             node_type = type(node)
-            # A declared-safe node/function (dtc.declare_safe) never writes
-            # context names, so it can't stale a scope local. Scope locals
-            # are read only by compiled code; a safe container's interpreted
-            # children read the live context, which visit_for/visit_with
-            # always maintain in parallel. Its child_nodelists still recurse
-            # below — a nested {% poke %}-style writer stays opaque.
+            # A declared node/function never writes undeclared context
+            # names, so it can't silently stale a scope local: a safe node
+            # writes nothing, and visit_bridge resyncs any local shadowed
+            # by a dtc_context_writes name right after the bridge. Scope
+            # locals are read only by compiled code; a declared container's
+            # interpreted children read the live context, which
+            # visit_for/visit_with always maintain in parallel. Its
+            # child_nodelists still recurse below — a nested
+            # {% poke %}-style writer stays opaque.
             if node_type not in self._handlers:
-                if not _is_declared_safe(node):
+                if _declared_writes(node) is None:
                     result = True
                     break
             elif (

@@ -182,6 +182,33 @@ def ctx_reader_safe(context, key):
 ctx_reader_safe.dtc_context_safe = True
 
 
+class StoreNode(template.Node):
+    """A capture tag: renders its body and stores the result in a context
+    variable whose name is fixed at parse time — the declared-writes case."""
+
+    dtc_context_writes = ("save_to",)
+    child_nodelists = ("nodelist",)
+
+    def __init__(self, nodelist, save_to):
+        self.nodelist = nodelist
+        self.save_to = save_to
+
+    def render(self, context):
+        context[self.save_to] = self.nodelist.render(context)
+        return ""
+
+
+@register.tag
+def store(parser, token):
+    """{% store as name %}...{% endstore %}"""
+    pieces = token.split_contents()
+    if len(pieces) != 3 or pieces[1] != "as":
+        raise template.TemplateSyntaxError("usage: {% store as name %}")
+    nodelist = parser.parse(("endstore",))
+    parser.delete_first_token()
+    return StoreNode(nodelist, pieces[2])
+
+
 def make_backend(cls, **options):
     return cls(
         {

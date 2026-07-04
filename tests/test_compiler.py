@@ -1284,3 +1284,155 @@ def test_declared_safe_inherited_by_subclass():
 
     assert _is_declared_safe(Inherits("name"))
     assert not _is_declared_safe(OptsOut("name"))
+
+
+# --- dtc_context_writes declarations -----------------------------------------
+
+
+def test_declared_writes_differential():
+    assert_identical_and_compiled("{% store as r %}x={{ name }}{% endstore %}{{ r }}")
+    assert_identical_and_compiled(  # the motivating example: forloop in the body
+        "{% store as csv %}{% for v in items %}{{ v }}"
+        "{% if not forloop.last %},{% endif %}{% endfor %}{% endstore %}[{{ csv }}]"
+    )
+    # store inside a loop writes the loop scope: the value is visible after
+    # the store, gone after the loop pops — stock semantics, preserved.
+    assert_identical_and_compiled(
+        "{% for x in items %}{% store as s %}{{ x }}!{% endstore %}{{ s }};"
+        "{% endfor %}[{{ s }}]"
+    )
+    # read before and after the write
+    assert_identical_and_compiled(
+        "[{{ r }}]{% store as r %}v{% endstore %}[{{ r }}]" + FLAT_MANY
+    )
+
+
+def test_declared_writes_keeps_flat_snapshot():
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% store as stored %}v{% endstore %}{{ stored }}" + FLAT_MANY
+    )
+    source = template._compiled.__dtc_source__
+    assert "_flat_get('name'" in source  # snapshot survives the declared write
+    assert "_flat_get('stored'" not in source  # the declared name walks
+
+
+def test_declared_writes_scope_local_resync():
+    """A declared write that shadows a loop-bound name must not leave the
+    scope local stale: the bridge resyncs it."""
+    source = (
+        "{% for x in items %}{% store as x %}S{{ forloop.counter }}{% endstore %}"
+        "{{ x }};{% endfor %}"
+    )
+    assert_identical_and_compiled(source)
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(source)
+    compiled = template._compiled.__dtc_source__
+    assert "_lv0_x" in compiled  # locals stay on
+    assert "_lv0_x = _context_get('x')" in compiled  # ...resynced after the bridge
+    assert template.render(base_context()) == "S1;S2;S3;"
+
+
+def test_declared_writes_shareable():
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% store as r %}v{% endstore %}{{ r }}"
+    )
+    assert template._compiled.__dtc_shareable__
+
+
+def test_check_declarations_allows_declared_writes(monkeypatch):
+    monkeypatch.setenv("DTC_CHECK_DECLARATIONS", "1")
+    assert_identical_and_compiled(
+        "{% store as r %}x={{ name }}{% endstore %}{{ r }}"
+    )
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% store as r %}v{% endstore %}{{ r }}"
+    )
+    assert "_checked_safe_render(_node_0, context, _writes_0)" in (
+        template._compiled.__dtc_source__
+    )
+
+
+def test_check_declarations_catches_undeclared_write(monkeypatch):
+    """A writer declaring the wrong attribute (so no keys resolve) is a
+    lying declaration: its real write must raise."""
+    import dtc
+    import support
+
+    monkeypatch.setattr(
+        support.ContextPokeNode, "dtc_context_writes", ("missing_attr",), raising=False
+    )
+    monkeypatch.setenv("DTC_CHECK_DECLARATIONS", "1")
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% poke z %}"
+    )
+    with pytest.raises(dtc.ContextSafeViolation, match="ContextPokeNode"):
+        template.render(base_context())
+
+
+def test_declared_writes_via_attribute_name(monkeypatch):
+    """ContextPokeNode honestly declared: var_name holds the written key,
+    so the declaration unlocks flattening and passes check mode."""
+    import support
+
+    monkeypatch.setattr(
+        support.ContextPokeNode, "dtc_context_writes", ("var_name",), raising=False
+    )
+    monkeypatch.setenv("DTC_CHECK_DECLARATIONS", "1")
+    template = make_backend(DTCTemplates, builtins=["support"]).from_string(
+        "{% poke z %}{{ z }}" + FLAT_MANY
+    )
+    source = template._compiled.__dtc_source__
+    assert "_flat_get('name'" in source
+    assert "_flat_get('z'" not in source
+    assert template.render(base_context()).startswith("<poke>poked")
+
+
+def test_declare_writes_helper():
+    import dtc
+    from django import template
+
+    class LocalStore(template.Node):
+        def __init__(self):
+            self.target = "t"
+
+        def render(self, context):
+            context[self.target] = "v"
+            return ""
+
+    assert dtc.declare_writes(LocalStore, "target") is LocalStore
+    assert LocalStore.dtc_context_writes == ("target",)
+
+    class Sub(LocalStore):
+        pass
+
+    from dtc.compiler import _declared_writes
+
+    assert _declared_writes(Sub()) == frozenset({"t"})  # inherited
+    assert _declared_writes(LocalStore()) == frozenset({"t"})
+
+    with pytest.raises(TypeError):
+        dtc.declare_writes(lambda ctx: "")  # not a Node class
+    with pytest.raises(TypeError):
+        dtc.declare_writes(LocalStore, 42)  # attr names must be strings
+
+
+def test_declared_writes_none_target_is_optional():
+    """An attribute holding None (optional 'as var' unused) contributes no
+    write; a non-string value voids the declaration conservatively."""
+    from django import template
+
+    from dtc.compiler import _declared_writes
+
+    class MaybeStore(template.Node):
+        dtc_context_writes = ("save_to",)
+
+        def __init__(self, save_to):
+            self.save_to = save_to
+
+        def render(self, context):
+            if self.save_to is not None:
+                context[self.save_to] = "v"
+            return ""
+
+    assert _declared_writes(MaybeStore("x")) == frozenset({"x"})
+    assert _declared_writes(MaybeStore(None)) == frozenset()
+    assert _declared_writes(MaybeStore(42)) is None  # unusable: stays opaque

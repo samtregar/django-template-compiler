@@ -2,7 +2,7 @@
 
 __version__ = "0.0.1"
 
-__all__ = ["ContextSafeViolation", "declare_safe", "__version__"]
+__all__ = ["ContextSafeViolation", "declare_safe", "declare_writes", "__version__"]
 
 
 class ContextSafeViolation(Exception):
@@ -73,3 +73,48 @@ def declare_safe(obj):
         )
     obj.dtc_context_safe = True
     return obj
+
+
+def declare_writes(node_class, *attr_names):
+    """Declare that a Node subclass's ``render()`` writes exactly the
+    context keys held in the named *instance attributes* — and follows the
+    rest of the ``declare_safe`` contract for everything else.
+
+    The attributes are named (rather than the keys themselves) because
+    write targets are parse-time data::
+
+        class StoreNode(Node):
+            def __init__(self, nodelist, save_to):
+                self.nodelist = nodelist
+                self.save_to = save_to     # {% store as NAME %}
+            def render(self, context):
+                context[self.save_to] = self.nodelist.render(context)
+                return ""
+
+        dtc.declare_writes(StoreNode, "save_to")
+        # or, on a class you own, equivalently:
+        #     dtc_context_writes = ("save_to",)
+
+    The promise, per ``render()`` call: the only context mutations are
+    ``context[k] = value`` for keys held in the named attributes — no other
+    writes, no deletions, no net push/pop, and clauses (b)–(d) of the
+    ``declare_safe`` contract. An attribute holding None means an optional
+    target unused at that site. With no attributes this is equivalent to
+    ``declare_safe``. Only Node subclasses can declare writes (a
+    ``takes_context`` function's targets aren't inspectable); subclasses
+    inherit the declaration.
+
+    Verify with ``DTC_CHECK_DECLARATIONS=1``: writes outside the declared
+    keys raise ``ContextSafeViolation``.
+    """
+    from django.template.base import Node
+
+    if not (isinstance(node_class, type) and issubclass(node_class, Node)):
+        raise TypeError(
+            f"declare_writes() expects a django.template.Node subclass, "
+            f"got {node_class!r}"
+        )
+    if not all(isinstance(a, str) for a in attr_names):
+        raise TypeError("declare_writes() attribute names must be strings")
+    node_class.dtc_context_writes = attr_names
+    return node_class

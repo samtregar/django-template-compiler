@@ -206,34 +206,46 @@ def _context_snapshot(context):
     return [dict(d) for d in context.dicts]
 
 
-def _diff_layers(label, before, context):
-    """Raise ContextSafeViolation if any context layer changed, naming the
-    added/removed/changed keys in the first layer that did."""
+def _diff_layers(label, before, context, allowed=frozenset()):
+    """Raise ContextSafeViolation if any context layer changed beyond the
+    declared *allowed* keys, naming the offending keys in the first layer
+    that did. Declared writes mean "may set": a removed key always violates
+    (deleting can change what an outer-scope read resolves to, which the
+    resynced scope locals don't model)."""
     from . import ContextSafeViolation
 
     for i, (was, now) in enumerate(zip(before, context.dicts)):
         now = dict(now)
         if now == was:
             continue
-        added = sorted(k for k in now if k not in was)
+        added = sorted(k for k in now if k not in was and k not in allowed)
         removed = sorted(k for k in was if k not in now)
         changed = sorted(
-            k for k in now if k in was and now[k] is not was[k] and now[k] != was[k]
+            k
+            for k in now
+            if k in was
+            and k not in allowed
+            and now[k] is not was[k]
+            and now[k] != was[k]
         )
+        if not (added or removed or changed):
+            continue
+        declared = f" (declared writes: {sorted(allowed)!r})" if allowed else ""
         raise ContextSafeViolation(
-            f"{label} is declared dtc_context_safe but mutated context "
-            f"layer {i} (contract clause (a)): "
+            f"{label} is declared context-safe{declared} but mutated context "
+            f"layer {i} beyond its declaration (contract clause (a)): "
             f"added={added!r} removed={removed!r} changed={changed!r}"
         )
 
 
-def checked_safe_render(node, context):
+def checked_safe_render(node, context, allowed=frozenset()):
     """DTC_CHECK_DECLARATIONS bridge for a node declared
-    ``dtc_context_safe``: verifies contract clauses (a) — no net context
-    writes — and (b) — no state keyed by node identity — on every call.
-    Clause (c), source-determinism, is not mechanically checkable, nor is
-    an unlisted child nodelist (clause (d)). TagHelperNodes are exempt from
-    the identity check: their declaration rides on the tag function (only
+    ``dtc_context_safe`` or ``dtc_context_writes``: verifies contract
+    clauses (a) — no context writes beyond the declared *allowed* keys —
+    and (b) — no state keyed by node identity — on every call. Clause (c),
+    source-determinism, is not mechanically checkable, nor is an unlisted
+    child nodelist (clause (d)). TagHelperNodes are exempt from the
+    identity check: their declaration rides on the tag function (only
     clause (a) applies), and InclusionNode's own per-render template cache
     is Django's blessed machinery."""
     from . import ContextSafeViolation
@@ -244,11 +256,11 @@ def checked_safe_render(node, context):
     result = node.render_annotated(context)
     if len(context.dicts) != depth_before:
         raise ContextSafeViolation(
-            f"{label} is declared dtc_context_safe but changed the context "
+            f"{label} is declared context-safe but changed the context "
             f"stack depth from {depth_before} to {len(context.dicts)} "
             "(unbalanced push/pop violates contract clause (a))"
         )
-    _diff_layers(label, before, context)
+    _diff_layers(label, before, context, allowed)
     from django.template.library import TagHelperNode
 
     if not isinstance(node, TagHelperNode) and any(
